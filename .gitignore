@@ -1,0 +1,13 @@
+# Built apps (created by install)
+LabStreamLayer.app
+dist/
+.build/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.spec
+
+# Mac
+.DS_Store

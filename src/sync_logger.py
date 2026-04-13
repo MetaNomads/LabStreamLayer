@@ -1,26 +1,23 @@
 """
-sync_logger.py — Writes pingLog_DATETIME.csv
+sync_logger.py — Writes syncLog_DATETIME.csv inside lsl_DATETIME/ session folder
 
-Format: one row per event, long/tidy format.
+Columns: machine, event, ping_id, local_epoch_ns, latency_ns
 
-Columns:
-  machine        — lsl, emotibit, polar, unity
-  event          — ping_sent (lsl only), ping_received (devices)
+  machine        — lsl | polar | emotibit | unity
+  event          — ping_sent | ping_received
   ping_id        — e.g. ping_001
-  lsl_epoch_ns   — LSL machine UTC ns at send time (only for lsl row, null for devices)
-  latency_ns     — one-way travel time in ns (0 for lsl row, calibrated value for devices)
+  local_epoch_ns — the clock of the machine that wrote this row:
+                     lsl row     : LSL clock at send time
+                     polar row   : LSL clock at send time (BLE, no device echo)
+                     emotibit row: empty (no receipt confirmation)
+                     unity row   : Unity clock at receipt (returned in ACK)
+  latency_ns     — calibrated one-way latency (0 for lsl row)
 
-Only rows for devices that are checked as required are written.
-
-Example (emotibit + polar required, unity not):
-  machine,   event,          ping_id,   lsl_epoch_ns,         latency_ns
-  lsl,       ping_sent,      ping_001,  1744500000000000000,  0
-  emotibit,  ping_received,  ping_001,  ,                     6200000
-  polar,     ping_received,  ping_001,  ,                     4800000
-
-Post-processing:
-  device_receive_time_in_lsl_clock    = lsl_epoch_ns + latency_ns
-  device_receive_time_in_device_clock = device_recorded_time - latency_ns
+Example:
+  lsl,      ping_sent,     ping_001, 1744500000000000000, 0
+  polar,     ping_received, ping_001, 1744500000004800000, 4800000
+  emotibit,  ping_received, ping_001, ,                   6200000
+  unity,     ping_received, ping_001, 1744500123456789000, 4400000
 """
 
 import csv
@@ -36,51 +33,69 @@ class SyncLogger:
         self._file       = None
         self._writer     = None
         self._count      = 0
-        # Which devices to log — set by main_window before session start
         self.log_emotibit = True
         self.log_polar    = True
         self.log_unity    = False
 
-    def start_session(self, session_ts: str) -> Path:
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+    def start_session(self, session_ts: str, session_dir: "Path | None" = None) -> Path:
+        """
+        session_dir: pre-created folder (lsl_TIMESTAMP/).
+        Falls back to _output_dir if not provided.
+        """
+        folder = session_dir if session_dir else self._output_dir
+        folder.mkdir(parents=True, exist_ok=True)
         self._count = 0
-        # File name: pingLog_YYYY-MM-DD_HH-MM-SS
-        path = self._output_dir / f"pingLog_{session_ts}.csv"
+        path = folder / f"syncLog_{session_ts}.csv"
         self._file   = open(path, "w", newline="", buffering=1)
         self._writer = csv.writer(self._file)
-        self._writer.writerow(["machine", "event", "ping_id", "lsl_epoch_ns", "latency_ns"])
+        self._writer.writerow(["machine", "event", "ping_id", "local_epoch_ns", "latency_ns"])
         return path
 
     def log_ping(
         self,
-        emotibit_latency_ns: int = -1,
+        polar_send_ns:       int = 0,
         polar_latency_ns:    int = -1,
-        unity_latency_ns:    int = -1,
+        emotibit_latency_ns: int = -1,
     ) -> tuple:
         """
-        Write one ping. LSL row always written. Device rows only if checked.
-        lsl_epoch_ns is populated only for the lsl row (null for devices).
+        Write LSL + Polar + EmotiBit rows at ping send time.
         Returns (ping_id, send_ns).
+        Unity row written separately via log_unity_ack() when ACK arrives.
         """
         self._count += 1
         pid     = f"ping_{self._count:03d}"
         send_ns = time.time_ns()
 
         if self._writer:
-            # LSL row — origin, lsl_epoch_ns populated, latency=0
+            # LSL row
             self._writer.writerow(["lsl", "ping_sent", pid, send_ns, 0])
 
-            # Device rows — lsl_epoch_ns is null, latency is one-way
-            if self.log_emotibit:
-                self._writer.writerow(["emotibit", "ping_received", pid, "", emotibit_latency_ns])
-            if self.log_polar:
-                self._writer.writerow(["polar", "ping_received", pid, "", polar_latency_ns])
-            if self.log_unity:
-                self._writer.writerow(["unity", "ping_received", pid, "", unity_latency_ns])
+            # Polar — local_epoch_ns = LSL clock at send (BLE has no device echo)
+            if self.log_polar and polar_latency_ns >= 0:
+                self._writer.writerow(
+                    ["polar", "ping_received", pid, polar_send_ns or send_ns, polar_latency_ns]
+                )
+
+            # EmotiBit — no receipt timestamp available
+            if self.log_emotibit and emotibit_latency_ns >= 0:
+                self._writer.writerow(
+                    ["emotibit", "ping_received", pid, "", emotibit_latency_ns]
+                )
 
             self._file.flush()
 
         return pid, send_ns
+
+    def log_unity_ack(self, ping_id: str, unity_epoch_ns: int, latency_ns: int):
+        """
+        Write Unity row when ACK arrives with Unity's local timestamp.
+        Called from unity.py when ACK:ping_NNN:<unity_ns> is received.
+        """
+        if self._writer and self.log_unity:
+            self._writer.writerow(
+                ["unity", "ping_received", ping_id, unity_epoch_ns, latency_ns]
+            )
+            self._file.flush()
 
     def close(self):
         if self._file:

@@ -28,6 +28,7 @@ import re
 import socket
 import subprocess
 import threading
+from collections import deque
 import time
 import logging
 from dataclasses import dataclass
@@ -149,6 +150,9 @@ class EmotiBitHandler(QObject):
         # RB echo signalling for SD card check
         self._rb_event   = threading.Event()
         self.sd_card_ok: Optional[bool] = None  # None=unknown, True=ok, False=failed
+        self._rtt_buffer = deque(maxlen=20)      # rolling RTT samples
+        self._continuous_calib_active = False
+        self._session_latency_ns: int = -1        # locked at record-start calibration
 
     # ── Lifecycle ────────────────────────────────────────────────────────────────
 
@@ -252,7 +256,7 @@ class EmotiBitHandler(QObject):
         self._set_status(EmotiBitStatus.CONNECTED)
         self.log_message.emit(f"[EmotiBit] Connecting to {device.display_name}")
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-        threading.Thread(target=lambda: self._calibrate(delay=3.0), daemon=True).start()
+        threading.Thread(target=self.start_continuous_calibration, daemon=True).start()
 
     def _send_tl_now(self):
         """Send TL immediately (called on connect and before recording)."""
@@ -262,6 +266,7 @@ class EmotiBitHandler(QObject):
 
     def disconnect(self):
         self._connected = None
+        self._session_latency_ns = -1
         if self._tcp_client:
             try:
                 self._tcp_client.close()
@@ -308,8 +313,6 @@ class EmotiBitHandler(QObject):
             self.log_message.emit("[EmotiBit] Not connected")
             return
 
-        threading.Thread(target=lambda: self._calibrate(delay=5.0), daemon=True).start()
-
         filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
         self._send_ctrl(self._pkt("TL", datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")))
         time.sleep(0.05)
@@ -333,30 +336,24 @@ class EmotiBitHandler(QObject):
         self._set_status(EmotiBitStatus.CONNECTED)
         self.log_message.emit("[EmotiBit] RE (Record End) sent")
 
-    def send_marker(self, label: str) -> int:
+    def send_marker(self, label: str) -> tuple:
         """
-        Send UN (User Note) marker. Returns calibrated one-way latency in ns.
-
-        Uses the pre-calibrated latency (median of 5 probes measured at connect
-        and at start_recording). Does NOT measure RTT per-ping — latency is
-        constant per session for consistent post-processing alignment.
-
-        Send sequence (fastest path):
-          1. Send UN x2 back-to-back (no sleep — kernel queues both ~50µs apart)
-          2. EmotiBit deduplicates by packet number, so x2 is safe redundancy
+        Send UN (User Note) marker. Returns (send_ns, calibrated_one_way_latency_ns).
         """
         if not self._connected:
             self.log_message.emit("[EmotiBit] Cannot send marker - not connected")
-            return self.calibrated_latency_ns
+            lat = self._session_latency_ns if self._session_latency_ns >= 0 else self.calibrated_latency_ns
+            return time.time_ns(), lat
 
         wall_clock = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
         pkt = self._pkt("UN", f"{wall_clock},{label}", data_len=2)
-        # Send twice back-to-back for UDP reliability — no sleep, kernel handles queuing
+        send_ns = time.time_ns()
         self._send_ctrl(pkt)
         self._send_ctrl(pkt)
 
         self.log_message.emit(f"[EmotiBit] marker sent: {label}")
-        return self.calibrated_latency_ns
+        lat = self._session_latency_ns if self._session_latency_ns >= 0 else self.calibrated_latency_ns
+        return send_ns, lat
 
     def _single_rtt(self) -> Optional[int]:
         """
@@ -388,42 +385,57 @@ class EmotiBitHandler(QObject):
         rtt = self._hh_recv_ns - t1
         return max(1_000_000, min(rtt, 500_000_000))
 
-    def _calibrate(self, n: int = 5, delay: float = 10.0) -> int:
+    def _update_latency(self):
+        """Recalculate calibrated_latency_ns from current rolling buffer."""
+        if not self._rtt_buffer:
+            return
+        samples = sorted(self._rtt_buffer)
+        median_rtt = samples[len(samples) // 2]
+        self.calibrated_latency_ns = median_rtt // 2
+        self.calibration_changed.emit(True)
+
+    def start_continuous_calibration(self):
         """
-        Calibration burst: send N HE→HH probes, discard outliers, take median.
-        delay: seconds to wait before probing (10s on connect, 5s on re-calibrate).
+        Probe HE→HH every 5s. Starts 3s after connect.
+        Updates calibrated_latency_ns after every measurement.
         """
-        self.log_message.emit(f"[EmotiBit] Calibration starting in {delay:.0f}s...")
-        time.sleep(delay)
-        if not self._connected:
-            return -1
-        samples = []
-        for i in range(n):
+        if self._continuous_calib_active:
+            return
+        self._continuous_calib_active = True
+        self.log_message.emit("[EmotiBit] Continuous calibration started (1 probe / 5s)")
+        time.sleep(3.0)
+        while self._running and self._connected:
             rtt = self._single_rtt()
             if rtt is not None:
-                samples.append(rtt)
-            time.sleep(0.1)   # 100ms between probes — avoid flooding
+                self._rtt_buffer.append(rtt)
+                self._update_latency()
+                self.log_message.emit(
+                    f"[EmotiBit] Probe: RTT={rtt/1e6:.1f}ms  "
+                    f"one-way={self.calibrated_latency_ns/1e6:.1f}ms  "
+                    f"(n={len(self._rtt_buffer)})"
+                )
+            time.sleep(5.0)
+        self._continuous_calib_active = False
 
-        if not samples:
-            self.log_message.emit("[EmotiBit] Calibration failed — no HH replies")
-            return self.calibrated_latency_ns
+    def calibrate_for_recording(self):
+        """10 probes at 1s intervals starting now. Uses whole buffer for final value."""
+        threading.Thread(target=self._record_calib, daemon=True).start()
 
-        samples.sort()
-        # Discard top outlier if we have enough samples
-        if len(samples) >= 4:
-            samples = samples[:-1]
-        median_rtt = samples[len(samples) // 2]
-        one_way    = median_rtt // 2
-        self._last_rtt_ns       = median_rtt
-        self.calibrated_latency_ns = one_way
+    def _record_calib(self):
+        self.log_message.emit("[EmotiBit] Record-start calibration (10 probes × 1s)...")
+        for _ in range(10):
+            if not self._connected:
+                break
+            rtt = self._single_rtt()
+            if rtt is not None:
+                self._rtt_buffer.append(rtt)
+            time.sleep(1.0)
+        self._update_latency()
+        self._session_latency_ns = self.calibrated_latency_ns
         self.log_message.emit(
-            f"[EmotiBit] Calibrated: "
-            f"median RTT={median_rtt/1e6:.1f}ms  "
-            f"one-way={one_way/1e6:.1f}ms  "
-            f"(n={len(samples)} samples)"
+            f"[EmotiBit] Session latency locked: one-way={self._session_latency_ns/1e6:.1f}ms "
+            f"(n={len(self._rtt_buffer)} samples)"
         )
-        self.calibration_changed.emit(True)
-        return one_way
 
     # ── Properties ───────────────────────────────────────────────────────────────
 

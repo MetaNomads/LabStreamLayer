@@ -9,6 +9,7 @@ import asyncio
 import csv
 import struct
 import threading
+from collections import deque
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -82,6 +83,8 @@ class PolarHandler(QObject):
         self._last_ble_latency_ns:  int = -1
         self.calibrated_latency_ns: int = -1
         self._calib_event = threading.Event()
+        self._rtt_buffer        = deque(maxlen=20)  # rolling RTT samples
+        self._session_latency_ns: int = -1           # locked at record-start calibration
         self._calib_result: int = -1
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -105,11 +108,10 @@ class PolarHandler(QObject):
     def disconnect(self):
         self._send_cmd(("disconnect",))
 
-    def start_recording(self, session_ts: str):
-        # Re-calibrate 5s after recording starts
-        self.calibrate(n=5, delay=5.0)
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        path = self._output_dir / f"polar_{session_ts}.csv"
+    def start_recording(self, session_ts: str, session_dir: "Path | None" = None):
+        folder = session_dir if session_dir else self._output_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"polar_{session_ts}.csv"
         self._csv_file = open(path, "w", newline="", buffering=1)
         self._writer = csv.writer(self._csv_file)
         # Sample frequency metadata
@@ -129,13 +131,18 @@ class PolarHandler(QObject):
         self._send_cmd(("stop_rec",))
         self._end_recording()
 
-    def send_marker(self, label: str) -> int:
-        """Send marker. Returns calibrated one-way BLE latency in ns."""
+    def send_marker(self, label: str) -> tuple:
+        """Send marker. Returns (send_ns, calibrated_one_way_latency_ns)."""
         send_ns = time.time_ns()
         if self._writer:
             self._writer.writerow([send_ns, "", "", "", label])
         self._send_cmd(("marker", label))
-        return self.calibrated_latency_ns
+        lat = self._session_latency_ns if self._session_latency_ns >= 0 else self.calibrated_latency_ns
+        return send_ns, lat
+
+    def calibrate_for_recording(self):
+        """10 BLE probes at 1s intervals. Uses whole buffer for final value."""
+        self._send_cmd(("calibrate_for_recording",))
 
     def calibrate(self, n: int = 5, delay: float = 10.0):
         """
@@ -144,6 +151,35 @@ class PolarHandler(QObject):
         """
         self._calib_event.clear()
         self._send_cmd(("calibrate", n, delay))
+
+    async def _continuous_probe(self, client):
+        """Probe BLE latency every 5s. Started as asyncio task after connect."""
+        await asyncio.sleep(3.0)
+        self.log_message.emit("[Polar] Continuous calibration started (1 probe / 5s)")
+        while client.is_connected:
+            try:
+                t1 = time.time_ns()
+                await client.write_gatt_char(PMD_CONTROL, ECG_SETTINGS, response=True)
+                rtt = time.time_ns() - t1
+                self._rtt_buffer.append(rtt)
+                self._update_latency()
+                self.log_message.emit(
+                    f"[Polar] Probe: RTT={rtt/1e6:.1f}ms  "
+                    f"one-way={self.calibrated_latency_ns/1e6:.1f}ms  "
+                    f"(n={len(self._rtt_buffer)})"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(5.0)
+
+    def _update_latency(self):
+        if not self._rtt_buffer:
+            return
+        samples = sorted(self._rtt_buffer)
+        median_rtt = samples[len(samples) // 2]
+        self._last_ble_latency_ns  = median_rtt // 2
+        self.calibrated_latency_ns = median_rtt // 2
+        self.calibration_changed.emit(True)
 
     @property
     def status(self) -> PolarStatus:
@@ -319,8 +355,8 @@ class PolarHandler(QObject):
                         self.log_message.emit(f"[Polar] Battery: {int(batt[0])}%")
                     except Exception:
                         pass
-                    # Run calibration burst 3s after connect
-                    await self._cmd_queue.put(("calibrate", 5, 3.0))
+                    # Start continuous calibration probe every 5s
+                    asyncio.ensure_future(self._continuous_probe(client))
 
                 except Exception as e:
                     self.log_message.emit(f"[Polar] Connect failed: {e}")
@@ -336,6 +372,7 @@ class PolarHandler(QObject):
                         pass
                 client = None
                 self.calibrated_latency_ns = -1
+                self._session_latency_ns = -1
                 self.calibration_changed.emit(False)
                 self._set_status(PolarStatus.IDLE)
                 self.log_message.emit("[Polar] Disconnected")
@@ -351,46 +388,23 @@ class PolarHandler(QObject):
                 label = cmd[1]
                 self.log_message.emit(f"[Polar] marker sent: {label}")
 
-            elif action == "calibrate":
-                n, delay = cmd[1], cmd[2]
+            elif action == "calibrate_for_recording":
+                # 10 BLE probes at 1s intervals, update rolling buffer
                 if not client or not client.is_connected:
-                    self.log_message.emit("[Polar] Calibration skipped — not connected")
-                    self._calib_event.set()
+                    self.log_message.emit("[Polar] Record-start calibration skipped — not connected")
                     continue
-                self.log_message.emit(f"[Polar] Calibration in {delay:.0f}s...")
-                await asyncio.sleep(delay)
-                if not client or not client.is_connected:
-                    self.log_message.emit("[Polar] Calibration aborted — disconnected")
-                    self._calib_event.set()
-                    continue
-                self.log_message.emit(f"[Polar] Calibrating BLE latency ({n} probes)...")
-                samples = []
-                for i in range(n):
+                self.log_message.emit("[Polar] Record-start calibration (10 probes × 1s)...")
+                for _ in range(10):
                     try:
                         t1 = time.time_ns()
                         await client.write_gatt_char(PMD_CONTROL, ECG_SETTINGS, response=True)
-                        t4 = time.time_ns()
-                        samples.append(t4 - t1)
+                        self._rtt_buffer.append(time.time_ns() - t1)
                     except Exception:
                         pass
-                    await asyncio.sleep(0.1)
-
-                if samples:
-                    samples.sort()
-                    if len(samples) >= 4:
-                        samples = samples[:-1]   # discard top outlier
-                    median_rtt = samples[len(samples) // 2]
-                    one_way    = median_rtt // 2
-                    self._last_ble_latency_ns  = one_way
-                    self.calibrated_latency_ns = one_way
-                    self._calib_result         = one_way
-                    self.log_message.emit(
-                        f"[Polar] Calibrated: "
-                        f"median RTT={median_rtt/1e6:.1f}ms  "
-                        f"one-way={one_way/1e6:.1f}ms  "
-                        f"(n={len(samples)} samples)"
-                    )
-                    self.calibration_changed.emit(True)
-                else:
-                    self.log_message.emit("[Polar] Calibration failed — no BLE responses")
-                self._calib_event.set()
+                    await asyncio.sleep(1.0)
+                self._update_latency()
+                self._session_latency_ns = self.calibrated_latency_ns
+                self.log_message.emit(
+                    f"[Polar] Session latency locked: one-way={self._session_latency_ns/1e6:.1f}ms "
+                    f"(n={len(self._rtt_buffer)} samples)"
+                )

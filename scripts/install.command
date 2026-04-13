@@ -7,11 +7,21 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Deactivate Conda if active to prevent it overriding python3
+if [ -n "$CONDA_DEFAULT_ENV" ]; then
+    echo "→ Deactivating conda env: $CONDA_DEFAULT_ENV"
+    source "$(conda info --base 2>/dev/null)/etc/profile.d/conda.sh" 2>/dev/null && conda deactivate 2>/dev/null || true
+fi
+unset PYTHONPATH
+unset PYTHONHOME
+
 ##############################################
-# 1. Detect Python
+# 1. Detect Python (prefer /usr/bin/python3 over Conda)
 ##############################################
 echo "→ Detecting Python..."
-if command -v python3 >/dev/null 2>&1; then
+if [ -x "/usr/bin/python3" ]; then
+    PYTHON_BIN="/usr/bin/python3"
+elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="python3"
 elif command -v python >/dev/null 2>&1; then
     PYTHON_BIN="python"
@@ -19,7 +29,7 @@ else
     echo "❌ ERROR: No python found. Install from https://python.org"
     exit 1
 fi
-echo "✓ $($PYTHON_BIN --version)"
+echo "✓ $($PYTHON_BIN --version)  ($PYTHON_BIN)"
 
 ##############################################
 # 2. Create venv

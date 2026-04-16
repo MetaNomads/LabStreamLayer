@@ -82,6 +82,7 @@ class PolarHandler(QObject):
         self._writer                = None
         self._last_ble_latency_ns:  int = -1
         self.calibrated_latency_ns: int = -1
+        self.has_streaming_data:    bool = False
         self._calib_event = threading.Event()
         self._rtt_buffer        = deque(maxlen=20)  # rolling RTT samples
         self._session_latency_ns: int = -1           # locked at record-start calibration
@@ -232,6 +233,7 @@ class PolarHandler(QObject):
                     r -= 0x1000000
                 if self._writer and recording:
                     self._writer.writerow([time.time_ns(), r, "", "", ""])
+                self.has_streaming_data = True
                 self.ecg_sample.emit(float(r))
                 i += 3
 
@@ -373,6 +375,7 @@ class PolarHandler(QObject):
                 client = None
                 self.calibrated_latency_ns = -1
                 self._session_latency_ns = -1
+                self.has_streaming_data    = False
                 self.calibration_changed.emit(False)
                 self._set_status(PolarStatus.IDLE)
                 self.log_message.emit("[Polar] Disconnected")

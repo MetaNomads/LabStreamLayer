@@ -144,6 +144,7 @@ class EmotiBitHandler(QObject):
         self._tcp_client: Optional[socket.socket] = None
         self._last_rtt_ns:        int = 10_000_000
         self.calibrated_latency_ns: int = -1
+        self.has_streaming_data:    bool = False
         # HH receipt signalling for calibration
         self._hh_event   = threading.Event()
         self._hh_recv_ns: int = 0
@@ -267,6 +268,7 @@ class EmotiBitHandler(QObject):
     def disconnect(self):
         self._connected = None
         self._session_latency_ns = -1
+        self.has_streaming_data = False
         if self._tcp_client:
             try:
                 self._tcp_client.close()
@@ -664,6 +666,7 @@ class EmotiBitHandler(QObject):
             try:
                 for v in parts[6:]:
                     if v:
+                        self.has_streaming_data = True
                         self.ppg_red_sample.emit(float(v))
             except (ValueError, IndexError):
                 pass

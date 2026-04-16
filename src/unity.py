@@ -60,7 +60,8 @@ class UnityHandler(QObject):
         self._sock:  Optional[socket.socket] = None
         self._out:   Optional[socket.socket] = None
         self._device: Optional[UnityDevice]  = None
-        self.calibrated_latency_ns: int = -1
+        self.calibrated_latency_ns: int  = -1
+        self.has_streaming_data:    bool = False
         self._pending_acks: Dict[str, tuple] = {}
         self._ack_lock     = threading.Lock()
         self._scan_results: List[UnityDevice] = []
@@ -78,11 +79,19 @@ class UnityHandler(QObject):
         self._running = True
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEPORT allows multiple sockets on the same port on macOS/Linux
+        if hasattr(socket, "SO_REUSEPORT"):
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self._sock.settimeout(1.0)
         try:
             self._sock.bind(("", self._port))
         except OSError as e:
-            self.log_message.emit(f"[Unity] Cannot bind port {self._port}: {e}")
+            self.log_message.emit(
+                f"[Unity] Cannot bind port {self._port}: {e}\n"
+                f"        Run: lsof -i :{self._port}  to find what's using it."
+            )
+            self._sock.close()
+            self._sock = None
             return
         self._out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._out.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -94,6 +103,7 @@ class UnityHandler(QObject):
         self._device  = None
         self.calibrated_latency_ns = -1
         self._session_latency_ns = -1
+        self.has_streaming_data    = False
         self.calibration_changed.emit(False)
         self.status_changed.emit("disconnected")
         if self._sock: self._sock.close()
@@ -337,14 +347,14 @@ class UnityHandler(QObject):
     # ── Data polling ─────────────────────────────────────────────────────────
 
     def start_data_stream(self, rate_hz: float = 3.0):
-        """Start polling Unity for data at rate_hz. Stops when disconnected."""
-        if self._streaming:
-            return   # already running — prevent duplicate threads
+        """Start or restart polling Unity for data. Safe to call multiple times."""
+        if not self._device:
+            return
+        # Stop existing loop before starting a new one
+        self._streaming = False
+        import time as _time; _time.sleep(0.05)   # let old loop exit
         self._streaming = True
-        interval = 1.0 / max(rate_hz, 1.0)
-        threading.Thread(
-            target=self._poll_loop, args=(interval,), daemon=True
-        ).start()
+        threading.Thread(target=self._poll_loop, daemon=True).start()
 
     def stop_data_stream(self):
         self._streaming = False
@@ -353,14 +363,13 @@ class UnityHandler(QObject):
         """Change streaming rate dynamically. Takes effect on next poll cycle."""
         self._stream_interval = 1.0 / max(rate_hz, 0.1)
 
-    def _poll_loop(self, interval: float):
+    def _poll_loop(self):
         while self._running and self._device and self._streaming:
             try:
                 self._out.sendto(b"REQUEST_DATA", (self._device.ip, self._port))
             except OSError:
                 pass
-            time.sleep(self._stream_interval)  # reads dynamically
-        self._streaming = False
+            time.sleep(self._stream_interval)
 
     def _update_latency(self):
         if not self._rtt_buffer:
@@ -441,6 +450,15 @@ class UnityHandler(QObject):
                     self.scan_progress.emit(
                         f"Found {len(self._scan_results)} device(s): {name} [{src_ip}]"
                     )
+
+            # If this HELLO is from our already-connected device (e.g. after domain
+            # reload), auto-send CONNECT to restore the handshake without user action
+            if self._device and src_ip == self._device.ip:
+                self.log_message.emit(f"[Unity] Known device reconnecting — sending CONNECT")
+                try:
+                    self._out.sendto(b"CONNECT", (src_ip, self._port))
+                except OSError:
+                    pass
             return
 
         if msg.startswith("CONNECTED"):
@@ -451,7 +469,19 @@ class UnityHandler(QObject):
             return
 
         if msg.startswith("DATA,unity,"):
+            self.has_streaming_data = True
             self.data_received.emit(msg)
+            return
+
+        if msg.startswith("RECONNECT,"):
+            # Unity domain reloaded — restore connection without full re-handshake
+            name = msg.split(",", 1)[1] if "," in msg else src_ip
+            dev  = UnityDevice(ip=src_ip, name=name)
+            self._device = dev
+            self._connect_event.set()
+            self.status_changed.emit("connected")
+            self.log_message.emit(f"[Unity] Reconnected after domain reload: {dev.display_name}")
+            self.start_data_stream()   # resume streaming after reconnect
             return
 
         if msg == "RECORDING_STARTED":

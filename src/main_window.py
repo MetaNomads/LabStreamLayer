@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt, QPointF, QRectF, QSettings, QTimer, pyqtSlot
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QFrame, QMessageBox,
-    QComboBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QComboBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QStackedWidget,
     QListWidgetItem, QMainWindow, QPlainTextEdit,
     QPushButton, QSizePolicy, QSpinBox,
     QCheckBox, QSplitter, QVBoxLayout, QWidget,
@@ -930,8 +930,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Lab Stream Layer")
         self.setMinimumSize(1100, 700)
 
-        self._session_ts   = None
-        self._is_recording = False
+        self._session_ts      = None
+        self._is_recording    = False
+        self._last_unity_device = None   # for auto-reconnect
         self._output_dir   = Path.home() / "SyncBridge_Recordings"
         self._elapsed      = 0
 
@@ -981,15 +982,9 @@ class MainWindow(QMainWindow):
         )
         self._sess_lbl = QLabel("No active session")
         self._sess_lbl.setStyleSheet(f"font-size:11px;color:{DIM};")
-        self._rec_lbl = QLabel("")
-        self._rec_lbl.setStyleSheet(
-            f"font-size:11px;color:{AMBER};font-weight:700;"
-        )
         hl.addWidget(title)
         hl.addStretch()
         hl.addWidget(self._sess_lbl)
-        hl.addSpacing(14)
-        hl.addWidget(self._rec_lbl)
         root.addWidget(hdr)
 
         # Body: two-column layout
@@ -1023,22 +1018,85 @@ class MainWindow(QMainWindow):
             bl.addWidget(row)
             row.required_checkbox.stateChanged.connect(self._update_start_btn)
 
+        # Optional: require VR data stream before allowing recording start
+        unity_opt_row = QHBoxLayout()
+        unity_opt_row.setContentsMargins(4, 0, 0, 0)
+        self._chk_require_vr_data = QCheckBox("Require VR data stream before recording")
+        self._chk_require_vr_data.setChecked(False)
+        self._chk_require_vr_data.setStyleSheet(
+            f"color:{DIM};font-size:10px;background:transparent;"
+        )
+        self._chk_require_vr_data.stateChanged.connect(self._update_start_btn)
+        unity_opt_row.addSpacing(20)
+        unity_opt_row.addWidget(self._chk_require_vr_data)
+        bl.addLayout(unity_opt_row)
+
         bl.addSpacing(2)
         bl.addWidget(Divider())
         bl.addSpacing(2)
 
-        # ── Recording ──────────────────────────────────────────────────────────
-        bl.addWidget(SLabel("Recording"))
-        bl.addSpacing(2)
-        rr = QHBoxLayout()
-        rr.setSpacing(10)
+        # ── Stacked: idle view / recording view ──────────────────────────────
+        self._stack = QStackedWidget()
+
+        # Page 0 — idle: devices label + start button
+        idle_w = QWidget()
+        idle_l = QVBoxLayout(idle_w)
+        idle_l.setContentsMargins(0, 0, 0, 0)
+        idle_l.setSpacing(8)
+        idle_l.addWidget(SLabel("Recording"))
+        idle_l.addSpacing(2)
         self._btn_start = ABtn("Start Recording", GREEN)
         self._btn_start.setEnabled(False)
-        self._btn_stop  = ABtn("Stop Recording",  RED)
-        self._btn_stop.setEnabled(False)
-        rr.addWidget(self._btn_start)
-        rr.addWidget(self._btn_stop)
-        bl.addLayout(rr)
+        idle_l.addWidget(self._btn_start)
+        self._stack.addWidget(idle_w)   # index 0
+
+        # Page 1 — recording: session info + stop button
+        rec_w = QWidget()
+        rec_w.setStyleSheet(
+            f"background:{PANEL};border:1px solid {BDR};border-radius:8px;"
+        )
+        rec_l = QVBoxLayout(rec_w)
+        rec_l.setContentsMargins(12, 10, 12, 10)
+        rec_l.setSpacing(6)
+        self._rec_session_lbl = QLabel("Session: —")
+        self._rec_session_lbl.setStyleSheet(
+            f"font-size:12px;font-weight:700;color:{GREEN};background:transparent;"
+        )
+        self._rec_timer_lbl = QLabel("00:00:00")
+        self._rec_timer_lbl.setStyleSheet(
+            f"font-size:22px;font-weight:800;color:{AMBER};letter-spacing:2px;background:transparent;"
+        )
+        self._btn_stop = ABtn("Stop Recording", RED)
+        rec_l.addWidget(self._rec_session_lbl)
+        rec_l.addWidget(self._rec_timer_lbl)
+        rec_l.addWidget(self._btn_stop)
+        self._stack.addWidget(rec_w)    # index 1
+
+        # Page 2 — failed: warning message + back button
+        fail_w = QWidget()
+        fail_w.setStyleSheet(
+            f"background:{PANEL};border:1px solid {RED};border-radius:8px;"
+        )
+        fail_l = QVBoxLayout(fail_w)
+        fail_l.setContentsMargins(12, 10, 12, 10)
+        fail_l.setSpacing(8)
+        fail_icon = QLabel("⚠  Recording request failed")
+        fail_icon.setStyleSheet(
+            f"font-size:12px;font-weight:700;color:{RED};background:transparent;"
+        )
+        self._fail_msg_lbl = QLabel("")
+        self._fail_msg_lbl.setWordWrap(True)
+        self._fail_msg_lbl.setStyleSheet(
+            f"font-size:11px;color:{TEXT};background:transparent;"
+        )
+        self._btn_fail_back = ABtn("Back", DIM)
+        self._btn_fail_back.clicked.connect(self._on_fail_back)
+        fail_l.addWidget(fail_icon)
+        fail_l.addWidget(self._fail_msg_lbl)
+        fail_l.addWidget(self._btn_fail_back)
+        self._stack.addWidget(fail_w)   # index 2
+
+        bl.addWidget(self._stack)
 
         bl.addSpacing(2)
         bl.addWidget(Divider())
@@ -1191,6 +1249,10 @@ class MainWindow(QMainWindow):
     def _wire(self):
         self._btn_start.clicked.connect(self._start_rec)
         self._btn_stop.clicked.connect(self._stop_rec)
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(2000)
+        self._status_timer.timeout.connect(self._refresh_status)
+        self._status_timer.start()
         self._btn_ping.clicked.connect(self._ping)
 
         self._emotibit.status_changed.connect(self._on_e)
@@ -1223,12 +1285,14 @@ class MainWindow(QMainWindow):
             dlg = UnityPickerDialog(self._unity, self)
             result = dlg.exec()
             if result == QDialog.DialogCode.Accepted and dlg.selected_device:
+                self._last_unity_device = dlg.selected_device
                 self._unity.connect_device(dlg.selected_device)
         except Exception:
             self._log(f"[Unity] Error opening picker: {traceback.format_exc()}")
 
     @pyqtSlot()
     def _unity_disconnect(self):
+        self._last_unity_device = None   # clear so no auto-reconnect
         self._unity.disconnect_device()
         self._update_start_btn()
 
@@ -1337,6 +1401,7 @@ class MainWindow(QMainWindow):
             self._emotibit.calibrate_for_recording()
         if self._row_unity.is_required:
             self._unity.calibrate_for_recording()
+            self._unity.start_data_stream()   # restart if previously stopped
             self._unity.start_data_stream(rate_hz=3.0)
         self._is_recording = True
         self._elapsed = 0
@@ -1345,13 +1410,18 @@ class MainWindow(QMainWindow):
         # First auto-ping at t=10s, then every 5s for 3 total
         QTimer.singleShot(5000, self._start_auto_ping_sequence)  # first ping at t=5s
         self._btn_start.setEnabled(False)
-        self._btn_stop.setEnabled(True)
         self._btn_ping.setEnabled(True)
         self._btn_ping.setToolTip("")
         self._set_controls_enabled(False)
         self._sess_lbl.setText(f"Session: {self._session_ts}")
         self._sess_lbl.setStyleSheet(f"font-size:11px;color:{GREEN};")
-        self._log(f"Session started — auto-ping: 3× starting at t=10s")
+        # Switch to recording view
+        self._stack.setCurrentIndex(1)
+        self._rec_session_lbl.setText(f"Session: {self._session_ts}")
+        self._rec_timer_lbl.setText("00:00:00")
+        for row in (self._row_eb, self._row_polar, self._row_unity):
+            row.setVisible(False)
+        self._log(f"Session started — auto-ping: 3× starting at t=5s")
 
     @pyqtSlot()
     def _stop_rec(self):
@@ -1359,19 +1429,24 @@ class MainWindow(QMainWindow):
             self._polar.stop_recording()
         if self._row_eb.is_required:
             self._emotibit.stop_recording()
-        self._unity.stop_data_stream()
         self._sync_logger.close()
         self._is_recording = False
         self._timer.stop()
         self._auto_ping_timer.stop()
         self._auto_ping_count = 0
-        self._rec_lbl.setText("")
+        # Reset streaming data flags so the check is enforced fresh next session
+        self._polar.has_streaming_data    = False
+        self._emotibit.has_streaming_data = False
+        self._unity.has_streaming_data    = False
         self._set_controls_enabled(True)
         self._btn_start.setEnabled(True)
-        self._btn_stop.setEnabled(False)
         self._btn_ping.setEnabled(False)
         self._btn_ping.setToolTip("Start recording first")
         self._sess_lbl.setStyleSheet(f"font-size:11px;color:{DIM};")
+        self._stack.setCurrentIndex(0)
+        for row in (self._row_eb, self._row_polar, self._row_unity):
+            row.setVisible(True)
+        self._update_start_btn()
         self._log(
             f"Session stopped - {self._sync_logger.ping_count} pings recorded"
         )
@@ -1427,13 +1502,13 @@ class MainWindow(QMainWindow):
         # Check conditions: at least one device required and all connected
         rows = {"emotibit": self._row_eb, "polar": self._row_polar, "unity": self._row_unity}
         required = [k for k, r in rows.items() if r.is_required]
+        self._log(f"[Unity] Recording request — required: {[k for k,r in rows.items() if r.is_required]}")
+
         if not required:
-            QMessageBox.warning(
-                self, "Cannot Start Recording",
-                "Unity requested recording but no devices are checked.\n\n"
-                "Check at least one device in LSL before starting.",
+            self._show_recording_failed(
+                "No devices are checked in LSL.\n"
+                "Check at least one device before starting."
             )
-            self._log("[Unity] ⚠ Recording request ignored — no devices checked")
             return
 
         not_ready = [k for k in required if not (
@@ -1442,17 +1517,39 @@ class MainWindow(QMainWindow):
             (k == "unity"    and self._unity.is_connected)
         )]
         if not_ready:
-            QMessageBox.warning(
-                self, "Cannot Start Recording",
-                f"Unity requested recording but these devices are not connected:\n"
-                f"{chr(10).join(not_ready)}\n\n"
-                "Connect all required devices first.",
+            self._show_recording_failed(
+                f"These required devices are not connected:\n" +
+                "\n".join(f"  • {k}" for k in not_ready)
             )
-            self._log(f"[Unity] ⚠ Recording request ignored — not connected: {', '.join(not_ready)}")
             return
 
-        self._log("[Unity] Recording started in Unity — starting LSL session...")
+        no_data = [k for k in required if not (
+            (k == "emotibit" and self._emotibit.has_streaming_data) or
+            (k == "polar"    and self._polar.has_streaming_data) or
+            (k == "unity"    and (not self._chk_require_vr_data.isChecked() or self._unity.has_streaming_data))
+        )]
+        if no_data:
+            self._show_recording_failed(
+                f"No streaming data received from:\n" +
+                "\n".join(f"  • {k}" for k in no_data) +
+                "\n\nWait for data to appear in the monitor."
+            )
+            return
+
+        self._log("[Unity] Conditions met — starting LSL session...")
         self._start_rec()
+
+    def _show_recording_failed(self, reason: str):
+        self._log(f"[Unity] ⚠ Recording request failed — {reason.split(chr(10))[0]}")
+        self._fail_msg_lbl.setText(reason)
+        # Show device rows so user can see/fix the issue
+        for row in (self._row_eb, self._row_polar, self._row_unity):
+            row.setVisible(True)
+        self._stack.setCurrentIndex(2)
+
+    def _on_fail_back(self):
+        self._stack.setCurrentIndex(0)
+        self._update_start_btn()
 
     @pyqtSlot(str)
     def _on_unity_data(self, msg: str):
@@ -1600,6 +1697,52 @@ class MainWindow(QMainWindow):
             self._row_unity.set_status("Connected — calibrating...", AMBER)
         else:
             self._row_unity.set_status("Waiting", DIM)
+            # Auto-reconnect if we have a last known device
+            if self._last_unity_device and not self._is_recording:
+                QTimer.singleShot(3000, self._auto_reconnect_unity)
+        self._update_start_btn()
+
+    def _auto_reconnect_unity(self):
+        """Try to reconnect to last known Unity device after disconnect."""
+        if not self._unity.is_connected and self._last_unity_device:
+            self._log(f"[Unity] Auto-reconnecting to {self._last_unity_device.display_name}...")
+            self._unity.connect_device(self._last_unity_device)
+
+    def _refresh_status(self):
+        """Periodically sync status display with actual device state."""
+        if self._is_recording:
+            return
+        # EmotiBit
+        if self._row_eb.is_required:
+            from emotibit import EmotiBitStatus
+            s = self._emotibit.status
+            if s == EmotiBitStatus.IDLE:
+                self._row_eb.set_status("Not Connected", RED)
+            elif s == EmotiBitStatus.CONNECTED:
+                if self._emotibit.calibrated_latency_ns > 0:
+                    self._row_eb.set_status("Connected — ready", GREEN)
+                else:
+                    self._row_eb.set_status("Connected — calibrating...", AMBER)
+        # Polar
+        if self._row_polar.is_required:
+            from polar_mac import PolarStatus
+            s = self._polar.status
+            if s == PolarStatus.IDLE:
+                self._row_polar.set_status("Not Connected", RED)
+            elif s == PolarStatus.CONNECTED:
+                if self._polar.calibrated_latency_ns > 0:
+                    self._row_polar.set_status("Connected — ready", GREEN)
+                else:
+                    self._row_polar.set_status("Connected — calibrating...", AMBER)
+        # Unity
+        if self._row_unity.is_required:
+            if self._unity.is_connected:
+                if self._unity.calibrated_latency_ns > 0:
+                    self._row_unity.set_status("Connected — ready", GREEN)
+                else:
+                    self._row_unity.set_status("Connected — calibrating...", AMBER)
+            else:
+                self._row_unity.set_status("Waiting", DIM)
         self._update_start_btn()
 
     @pyqtSlot(bool)
@@ -1636,6 +1779,13 @@ class MainWindow(QMainWindow):
                 return self._polar.calibrated_latency_ns > 0
             return self._unity.is_connected and self._unity.calibrated_latency_ns > 0
 
+        def _has_data(k):
+            if k == "emotibit": return self._emotibit.has_streaming_data
+            if k == "polar":    return self._polar.has_streaming_data
+            # Unity data check is optional
+            if not self._chk_require_vr_data.isChecked(): return True
+            return self._unity.has_streaming_data
+
         rows = {
             "emotibit": self._row_eb,
             "polar":    self._row_polar,
@@ -1645,6 +1795,7 @@ class MainWindow(QMainWindow):
         required        = [k for k, r in rows.items() if r.is_required]
         not_connected   = [k for k in required if not _connected(k)]
         not_calibrated  = [k for k in required if _connected(k) and not _calibrated(k)]
+        no_data         = [k for k in required if _connected(k) and _calibrated(k) and not _has_data(k)]
 
         if not required:
             self._btn_start.setEnabled(False)
@@ -1655,6 +1806,9 @@ class MainWindow(QMainWindow):
         elif not_calibrated:
             self._btn_start.setEnabled(False)
             self._btn_start.setToolTip(f"Calibrating: {', '.join(not_calibrated)}")
+        elif no_data:
+            self._btn_start.setEnabled(False)
+            self._btn_start.setToolTip(f"Waiting for data: {', '.join(no_data)}")
         else:
             self._btn_start.setEnabled(True)
             self._btn_start.setToolTip("")
@@ -1693,7 +1847,7 @@ class MainWindow(QMainWindow):
         self._elapsed += 1
         h, r = divmod(self._elapsed, 3600)
         m, s = divmod(r, 60)
-        self._rec_lbl.setText(f"REC  {h:02d}:{m:02d}:{s:02d}")
+        self._rec_timer_lbl.setText(f"{h:02d}:{m:02d}:{s:02d}")
 
     def _browse(self):
         p = QFileDialog.getExistingDirectory(
@@ -1724,6 +1878,7 @@ class MainWindow(QMainWindow):
             s.value("required_unity", False, type=bool)
         )
         self._stream_rate.setCurrentIndex(int(s.value('stream_rate_idx', 1)))
+        self._chk_require_vr_data.setChecked(s.value('require_vr_data', False, type=bool))
         self._update_start_btn()
 
     def _save_settings(self):
@@ -1733,6 +1888,7 @@ class MainWindow(QMainWindow):
         s.setValue("required_polar",    self._row_polar.required_checkbox.isChecked())
         s.setValue("required_unity",    self._row_unity.required_checkbox.isChecked())
         s.setValue("stream_rate_idx",   self._stream_rate.currentIndex())
+        s.setValue("require_vr_data",    self._chk_require_vr_data.isChecked())
 
     def closeEvent(self, event):
         self._save_settings()

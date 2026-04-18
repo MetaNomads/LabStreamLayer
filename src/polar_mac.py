@@ -124,8 +124,8 @@ class PolarHandler(QObject):
         self._csv_file.write("# rr_unit,milliseconds\n")
         self._writer.writerow(["utc_epoch_ns", "ecg_uv", "hr_bpm", "rr_ms", "marker"])
         self._set_status(PolarStatus.RECORDING)
-        self.log_message.emit(f"[Polar] Recording → {path.name}")
-        self.log_message.emit("[Polar] Sample rates: ECG=130Hz  HR=1Hz  RR=irregular")
+        self._try_emit(self.log_message, f"[Polar] Recording → {path.name}")
+        self._try_emit(self.log_message, "[Polar] Sample rates: ECG=130Hz  HR=1Hz  RR=irregular")
         self._send_cmd(("start_rec",))
 
     def stop_recording(self):
@@ -156,7 +156,7 @@ class PolarHandler(QObject):
     async def _continuous_probe(self, client):
         """Probe BLE latency every 5s. Started as asyncio task after connect."""
         await asyncio.sleep(3.0)
-        self.log_message.emit("[Polar] Continuous calibration started (1 probe / 5s)")
+        self._try_emit(self.log_message, "[Polar] Continuous calibration started (1 probe / 5s)")
         while client.is_connected:
             try:
                 t1 = time.time_ns()
@@ -164,7 +164,7 @@ class PolarHandler(QObject):
                 rtt = time.time_ns() - t1
                 self._rtt_buffer.append(rtt)
                 self._update_latency()
-                self.log_message.emit(
+                self._try_emit(self.log_message, 
                     f"[Polar] Probe: RTT={rtt/1e6:.1f}ms  "
                     f"one-way={self.calibrated_latency_ns/1e6:.1f}ms  "
                     f"(n={len(self._rtt_buffer)})"
@@ -180,7 +180,7 @@ class PolarHandler(QObject):
         median_rtt = samples[len(samples) // 2]
         self._last_ble_latency_ns  = median_rtt // 2
         self.calibrated_latency_ns = median_rtt // 2
-        self.calibration_changed.emit(True)
+        self._try_emit(self.calibration_changed, True)
 
     @property
     def status(self) -> PolarStatus:
@@ -192,10 +192,17 @@ class PolarHandler(QObject):
         if self._loop and self._cmd_queue:
             self._loop.call_soon_threadsafe(self._cmd_queue.put_nowait, cmd)
 
+    def _try_emit(self, signal, *args):
+        """Safely emit a signal from any thread. Guards against deleted QObject."""
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            pass
+
     def _set_status(self, s: PolarStatus):
         if s != self._status:
             self._status = s
-            self.status_changed.emit(s)
+            self._try_emit(self.status_changed, s)
 
     def _end_recording(self):
         if self._csv_file:
@@ -206,7 +213,7 @@ class PolarHandler(QObject):
                 pass
             self._csv_file = None
             self._writer = None
-            self.log_message.emit("[Polar] Recording closed")
+            self._try_emit(self.log_message, "[Polar] Recording closed")
         if self._status == PolarStatus.RECORDING:
             self._set_status(PolarStatus.CONNECTED)
 
@@ -220,7 +227,7 @@ class PolarHandler(QObject):
 
     async def _async_main(self):
         self._cmd_queue = asyncio.Queue()
-        self.log_message.emit("[Polar] Ready (macOS bleak)")
+        self._try_emit(self.log_message, "[Polar] Ready (macOS bleak)")
 
         client:    Optional[BleakClient] = None
         recording: bool = False
@@ -234,7 +241,7 @@ class PolarHandler(QObject):
                 if self._writer and recording:
                     self._writer.writerow([time.time_ns(), r, "", "", ""])
                 self.has_streaming_data = True
-                self.ecg_sample.emit(float(r))
+                self._try_emit(self.ecg_sample, float(r))
                 i += 3
 
         def on_hr(sender, data: bytearray):
@@ -245,19 +252,27 @@ class PolarHandler(QObject):
             if bpm > 0:
                 if self._writer and recording:
                     self._writer.writerow([time.time_ns(), "", bpm, "", ""])
-                self.hr_sample.emit(bpm)
+                self._try_emit(self.hr_sample, bpm)
             if flags & 0x10:
                 off = 3 if (flags & 0x01) else 2
                 while off + 1 < len(data):
                     rr = round(struct.unpack_from("<H", data, off)[0] * 1000 / 1024, 1)
                     if self._writer and recording:
                         self._writer.writerow([time.time_ns(), "", "", rr, ""])
-                    self.rr_sample.emit(rr)
+                    self._try_emit(self.rr_sample, rr)
                     off += 2
 
         def on_disconnect(c: BleakClient):
-            self.log_message.emit("[Polar] Device disconnected")
+            self._try_emit(self.log_message, "[Polar] Device disconnected — scheduling reconnect in 3s")
             self._set_status(PolarStatus.IDLE)
+            # Auto-reconnect: re-queue the same device after a short delay
+            import asyncio as _asyncio
+            async def _reconnect():
+                await _asyncio.sleep(3.0)
+                if self._status == PolarStatus.IDLE and device:
+                    self._try_emit(self.log_message, "[Polar] Auto-reconnecting...")
+                    await self._cmd_queue.put(("connect", device))
+            _asyncio.ensure_future(_reconnect())
 
         while True:
             cmd = await self._cmd_queue.get()
@@ -274,7 +289,7 @@ class PolarHandler(QObject):
 
             elif action == "scan":
                 duration = cmd[1]
-                self.log_message.emit(f"[Polar] Scanning for {duration:.0f}s...")
+                self._try_emit(self.log_message, f"[Polar] Scanning for {duration:.0f}s...")
                 found = []
                 try:
                     devices = await BleakScanner.discover(timeout=duration)
@@ -290,10 +305,10 @@ class PolarHandler(QObject):
                                 serial_number=sn,
                             )
                             found.append(pd)
-                            self.log_message.emit(f"[Polar] Found: {name} [{d.address}]")
-                    self.log_message.emit(f"[Polar] Scan complete — {len(found)} device(s)")
+                            self._try_emit(self.log_message, f"[Polar] Found: {name} [{d.address}]")
+                    self._try_emit(self.log_message, f"[Polar] Scan complete — {len(found)} device(s)")
                 except Exception as e:
-                    self.log_message.emit(f"[Polar] Scan error: {e}")
+                    self._try_emit(self.log_message, f"[Polar] Scan error: {e}")
                 self.devices_found.emit(found)
                 self._set_status(PolarStatus.IDLE)
 
@@ -304,7 +319,7 @@ class PolarHandler(QObject):
                 # If we have the address from scan, connect directly
                 # Otherwise scan by serial number
                 if device.address and len(device.address) > 10:
-                    self.log_message.emit(f"[Polar] Connecting to {device.name}...")
+                    self._try_emit(self.log_message, f"[Polar] Connecting to {device.name}...")
                     try:
                         ble_dev = await BleakScanner.find_device_by_address(
                             device.address, timeout=10.0
@@ -313,55 +328,55 @@ class PolarHandler(QObject):
                         ble_dev = None
                     if not ble_dev:
                         # Fall back to name scan
-                        self.log_message.emit("[Polar] Address not found, scanning by name...")
+                        self._try_emit(self.log_message, "[Polar] Address not found, scanning by name...")
                         ble_dev = await BleakScanner.find_device_by_filter(
                             lambda bd, _: bd.name and device.serial_number in (bd.name or ""),
                             timeout=10.0,
                         )
                 else:
-                    self.log_message.emit(f"[Polar] Scanning for {device.serial_number}...")
+                    self._try_emit(self.log_message, f"[Polar] Scanning for {device.serial_number}...")
                     ble_dev = await BleakScanner.find_device_by_filter(
                         lambda bd, _: bd.name and device.serial_number in (bd.name or ""),
                         timeout=10.0,
                     )
 
                 if not ble_dev:
-                    self.log_message.emit("[Polar] Device not found — wear strap and retry")
+                    self._try_emit(self.log_message, "[Polar] Device not found — wear strap and retry")
                     self._set_status(PolarStatus.IDLE)
                     continue
 
-                self.log_message.emit(f"[Polar] Connecting to {ble_dev.name}...")
+                self._try_emit(self.log_message, f"[Polar] Connecting to {ble_dev.name}...")
                 try:
                     client = BleakClient(ble_dev, disconnected_callback=on_disconnect, timeout=20.0)
                     await client.connect()
 
                     try:
                         await client.start_notify(HR_CHAR, on_hr)
-                        self.log_message.emit("[Polar] HR notify: OK")
+                        self._try_emit(self.log_message, "[Polar] HR notify: OK")
                     except Exception as e:
-                        self.log_message.emit(f"[Polar] HR notify: {e}")
+                        self._try_emit(self.log_message, f"[Polar] HR notify: {e}")
 
                     await client.start_notify(PMD_DATA, on_ecg)
-                    self.log_message.emit("[Polar] PMD_DATA notify: OK")
+                    self._try_emit(self.log_message, "[Polar] PMD_DATA notify: OK")
 
                     await client.write_gatt_char(PMD_CONTROL, ECG_SETTINGS, response=True)
                     await asyncio.sleep(0.3)
                     await client.write_gatt_char(PMD_CONTROL, ECG_START, response=True)
-                    self.log_message.emit("[Polar] ECG stream started (131 Hz)")
+                    self._try_emit(self.log_message, "[Polar] ECG stream started (131 Hz)")
 
                     self._set_status(PolarStatus.CONNECTED)
                     # Read battery level
                     try:
                         batt = await client.read_gatt_char(BATTERY_CHAR)
-                        self.battery_changed.emit(int(batt[0]))
-                        self.log_message.emit(f"[Polar] Battery: {int(batt[0])}%")
+                        self._try_emit(self.battery_changed, int(batt[0]))
+                        self._try_emit(self.log_message, f"[Polar] Battery: {int(batt[0])}%")
                     except Exception:
                         pass
                     # Start continuous calibration probe every 5s
                     asyncio.ensure_future(self._continuous_probe(client))
 
                 except Exception as e:
-                    self.log_message.emit(f"[Polar] Connect failed: {e}")
+                    self._try_emit(self.log_message, f"[Polar] Connect failed: {e}")
                     self._set_status(PolarStatus.IDLE)
                     client = None
 
@@ -376,9 +391,9 @@ class PolarHandler(QObject):
                 self.calibrated_latency_ns = -1
                 self._session_latency_ns = -1
                 self.has_streaming_data    = False
-                self.calibration_changed.emit(False)
+                self._try_emit(self.calibration_changed, False)
                 self._set_status(PolarStatus.IDLE)
-                self.log_message.emit("[Polar] Disconnected")
+                self._try_emit(self.log_message, "[Polar] Disconnected")
 
             elif action == "start_rec":
                 recording = True
@@ -389,14 +404,14 @@ class PolarHandler(QObject):
             elif action == "marker":
                 # Just log — no BLE write needed for marker, latency already calibrated
                 label = cmd[1]
-                self.log_message.emit(f"[Polar] marker sent: {label}")
+                self._try_emit(self.log_message, f"[Polar] marker sent: {label}")
 
             elif action == "calibrate_for_recording":
                 # 10 BLE probes at 1s intervals, update rolling buffer
                 if not client or not client.is_connected:
-                    self.log_message.emit("[Polar] Record-start calibration skipped — not connected")
+                    self._try_emit(self.log_message, "[Polar] Record-start calibration skipped — not connected")
                     continue
-                self.log_message.emit("[Polar] Record-start calibration (10 probes × 1s)...")
+                self._try_emit(self.log_message, "[Polar] Record-start calibration (10 probes × 1s)...")
                 for _ in range(10):
                     try:
                         t1 = time.time_ns()
@@ -407,7 +422,7 @@ class PolarHandler(QObject):
                     await asyncio.sleep(1.0)
                 self._update_latency()
                 self._session_latency_ns = self.calibrated_latency_ns
-                self.log_message.emit(
+                self._try_emit(self.log_message, 
                     f"[Polar] Session latency locked: one-way={self._session_latency_ns/1e6:.1f}ms "
                     f"(n={len(self._rtt_buffer)} samples)"
                 )

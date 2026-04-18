@@ -102,7 +102,7 @@ class DeviceRow(QWidget):
         self._btn_disc = GBtn("Disconnect")
         self._btn_disc.setMinimumHeight(28)
         self._btn_disc.setFixedWidth(84)
-        self._btn_disc.setEnabled(False)
+        self._btn_disc.setVisible(False)   # hidden until connected
         self._btn_scan.clicked.connect(on_scan)
         self._btn_disc.clicked.connect(on_disconnect)
 
@@ -116,16 +116,17 @@ class DeviceRow(QWidget):
     def set_controls_enabled(self, enabled: bool):
         self._chk.setEnabled(enabled)
         self._btn_scan.setEnabled(enabled)
-        self._btn_disc.setEnabled(enabled and "not" not in self._status.text().lower())
+        self._btn_disc.setEnabled(enabled)
 
     def set_status(self, text: str, color: str):
         self._status.setStyleSheet(
             f"font-size:10px;font-weight:600;color:{color};background:transparent;"
         )
         self._status.setText(text)
-        connected = color == GREEN or "recording" in text.lower() or "connected" in text.lower()
-        self._btn_disc.setEnabled(connected)
-        self._btn_scan.setText("Re-connect" if connected else "Connect")
+        # "Not Connected" contains "connected" — check color instead which is unambiguous
+        connected = color in (GREEN, AMBER) and "not" not in text.lower()
+        self._btn_scan.setVisible(not connected)
+        self._btn_disc.setVisible(connected)
 
     def set_battery(self, pct: int):
         if pct < 0:
@@ -1069,6 +1070,14 @@ class MainWindow(QMainWindow):
         self._btn_stop = ABtn("Stop Recording", RED)
         rec_l.addWidget(self._rec_session_lbl)
         rec_l.addWidget(self._rec_timer_lbl)
+        self._sensor_warn = QLabel("")
+        self._sensor_warn.setWordWrap(True)
+        self._sensor_warn.setVisible(False)
+        self._sensor_warn.setStyleSheet(
+            f"background:#3d1a1a;border:1px solid {RED};border-radius:5px;"
+            f"color:{RED};font-size:11px;font-weight:600;padding:6px 10px;"
+        )
+        rec_l.addWidget(self._sensor_warn)
         rec_l.addWidget(self._btn_stop)
         self._stack.addWidget(rec_w)    # index 1
 
@@ -1191,16 +1200,17 @@ class MainWindow(QMainWindow):
         rl.addSpacing(2)
 
         for label, color, unit in [
-            ("ECG — Polar H10",       BLUE,      "µV"),
-            ("HR — Polar H10",        GREEN,     "bpm"),
-            ("RR — Polar H10",        AMBER,     "ms"),
-            ("HR — EmotiBit",         GREEN,     "bpm"),
-            ("PPG Red — EmotiBit",    "#e05c5c", ""),
+            ("HR — EmotiBit",           GREEN,     "bpm"),
+            ("PPG Red — EmotiBit",      "#e05c5c", ""),
+            ("ECG — Polar H10",         BLUE,      "µV"),
+            ("HR — Polar H10",          GREEN,     "bpm"),
+            ("RR — Polar H10",          AMBER,     "ms"),
             ("Head Yaw — Unity",        BLUE,      "°"),
             ("Right Palm Yaw — Unity",  AMBER,     "°"),
             ("Left Palm Yaw — Unity",   "#b06fde", "°"),
             ("Gaze X — Unity",          "#4adede", ""),
-            ("Upper Lip L — Unity",     "#de4a8a", ""),
+            ("Brow Activity — Unity",   "#de4a8a", ""),
+            ("Blink — Unity",           "#80e0ff", ""),
         ]:
             row_lbl = QLabel(label.upper())
             row_lbl.setStyleSheet(
@@ -1219,7 +1229,8 @@ class MainWindow(QMainWindow):
                 "Right Palm Yaw — Unity":  "_g_u_rpyaw",
                 "Left Palm Yaw — Unity":   "_g_u_lpyaw",
                 "Gaze X — Unity":          "_g_u_gaze",
-                "Upper Lip L — Unity":     "_g_u_lip",
+                "Brow Activity — Unity":   "_g_u_brow",
+                "Blink — Unity":           "_g_u_blink",
             }[label]
             setattr(self, attr, g)
 
@@ -1253,6 +1264,10 @@ class MainWindow(QMainWindow):
         self._status_timer.setInterval(2000)
         self._status_timer.timeout.connect(self._refresh_status)
         self._status_timer.start()
+
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.setInterval(5000)
+        self._watchdog_timer.timeout.connect(self._watchdog_check)
         self._btn_ping.clicked.connect(self._ping)
 
         self._emotibit.status_changed.connect(self._on_e)
@@ -1340,47 +1355,6 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _start_rec(self):
-        # ── SD card safeguard ──────────────────────────────────────────────────
-        if self._row_eb.is_required and self._emotibit.status in (
-            EmotiBitStatus.CONNECTED, EmotiBitStatus.RECORDING
-        ):
-            self._log("[EmotiBit] Checking SD card...")
-            self._btn_start.setEnabled(False)
-            import threading
-            sd_result = [None]
-            done = __import__("threading").Event()
-
-            def _check():
-                sd_result[0] = self._emotibit.check_sd_card(timeout=3.0)
-                done.set()
-
-            threading.Thread(target=_check, daemon=True).start()
-
-            # Process Qt events while waiting (keeps UI responsive)
-            from PyQt6.QtCore import QEventLoop
-            loop = QEventLoop()
-            import threading as _t
-            _t.Thread(
-                target=lambda: (done.wait(), loop.quit()), daemon=True
-            ).start()
-            loop.exec()
-
-            if not sd_result[0]:
-                resp = QMessageBox.warning(
-                    self,
-                    "SD Card Not Detected",
-                    "EmotiBit did not confirm SD card is ready.\n\n"
-                    "The card may be missing, unseated, or the device is still initialising.\n\n"
-                    "Proceed without EmotiBit SD recording?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Cancel,
-                )
-                if resp != QMessageBox.StandardButton.Yes:
-                    self._update_start_btn()
-                    return
-                self._log("[EmotiBit] ⚠ Proceeding without SD card confirmation")
-            else:
-                self._log("[EmotiBit] ✓ SD card confirmed")
 
         self._session_ts = SyncLogger.make_session_timestamp()
 
@@ -1407,6 +1381,7 @@ class MainWindow(QMainWindow):
         self._elapsed = 0
         self._auto_ping_count = 0
         self._timer.start()
+        self._watchdog_timer.start()
         # First auto-ping at t=10s, then every 5s for 3 total
         QTimer.singleShot(5000, self._start_auto_ping_sequence)  # first ping at t=5s
         self._btn_start.setEnabled(False)
@@ -1433,6 +1408,8 @@ class MainWindow(QMainWindow):
         self._is_recording = False
         self._timer.stop()
         self._auto_ping_timer.stop()
+        self._watchdog_timer.stop()
+        self._sensor_warn.setVisible(False)
         self._auto_ping_count = 0
         # Reset streaming data flags so the check is enforced fresh next session
         self._polar.has_streaming_data    = False
@@ -1450,6 +1427,27 @@ class MainWindow(QMainWindow):
         self._log(
             f"Session stopped - {self._sync_logger.ping_count} pings recorded"
         )
+
+    @pyqtSlot()
+    def _watchdog_check(self):
+        """Every 5s during recording: check each required sensor is actually active."""
+        if not self._is_recording:
+            return
+        warnings = []
+        if self._row_eb.is_required:
+            if self._emotibit.status != EmotiBitStatus.RECORDING:
+                warnings.append("\u26a0  EmotiBit not recording \u2014 check device and SD card")
+        if self._row_polar.is_required:
+            if self._polar.status not in (PolarStatus.RECORDING, PolarStatus.CONNECTED):
+                warnings.append("\u26a0  Polar H10 disconnected")
+        if self._row_unity.is_required:
+            if not self._unity.is_connected:
+                warnings.append("\u26a0  Unity disconnected")
+        if warnings:
+            self._sensor_warn.setText("\n".join(warnings))
+            self._sensor_warn.setVisible(True)
+        else:
+            self._sensor_warn.setVisible(False)
 
     def _start_auto_ping_sequence(self):
         """Called at t=10s after recording starts. Fires first ping then starts interval timer."""
@@ -1596,8 +1594,11 @@ class MainWindow(QMainWindow):
             if "gazePointX" in fields:
                 self._g_u_gaze.push(fields["gazePointX"][0])
 
-            if "upperLipL" in fields:
-                self._g_u_lip.push(fields["upperLipL"][0])
+            if "au1" in fields and "au2" in fields and "au4" in fields:
+                self._g_u_brow.push(
+                    (fields["au1"][0] + fields["au2"][0] + fields["au4"][0]) / 3.0
+                )
+            if "blink" in fields: self._g_u_blink.push(fields["blink"][0])
 
         except Exception:
             pass   # never crash the UI on a bad packet
@@ -1820,7 +1821,7 @@ class MainWindow(QMainWindow):
         interval_ms = int(1000 / rate)
         self._unity.set_stream_rate(rate)
         for attr in ("_g_ecg","_g_hr","_g_rr","_g_eb_hr","_g_eb_ppg",
-                     "_g_u_yaw","_g_u_rpyaw","_g_u_lpyaw","_g_u_gaze","_g_u_lip"):
+                     "_g_u_yaw","_g_u_rpyaw","_g_u_lpyaw","_g_u_gaze","_g_u_brow","_g_u_blink"):
             g = getattr(self, attr, None)
             if g:
                 g.set_redraw_interval(interval_ms)

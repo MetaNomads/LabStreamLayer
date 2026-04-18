@@ -86,7 +86,7 @@ class UnityHandler(QObject):
         try:
             self._sock.bind(("", self._port))
         except OSError as e:
-            self.log_message.emit(
+            self._try_emit(self.log_message, 
                 f"[Unity] Cannot bind port {self._port}: {e}\n"
                 f"        Run: lsof -i :{self._port}  to find what's using it."
             )
@@ -96,7 +96,14 @@ class UnityHandler(QObject):
         self._out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._out.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         threading.Thread(target=self._listen, daemon=True).start()
-        self.log_message.emit(f"[Unity] Listening on UDP port {self._port}")
+        self._try_emit(self.log_message, f"[Unity] Listening on UDP port {self._port}")
+
+    def _try_emit(self, signal, *args):
+        """Safely emit a signal from any thread. Guards against deleted QObject."""
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            pass
 
     def stop(self):
         self._running = False
@@ -104,8 +111,8 @@ class UnityHandler(QObject):
         self.calibrated_latency_ns = -1
         self._session_latency_ns = -1
         self.has_streaming_data    = False
-        self.calibration_changed.emit(False)
-        self.status_changed.emit("disconnected")
+        self._try_emit(self.calibration_changed, False)
+        self._try_emit(self.status_changed, "disconnected")
         if self._sock: self._sock.close()
         if self._out:  self._out.close()
 
@@ -154,8 +161,8 @@ class UnityHandler(QObject):
 
     def _do_scan(self, duration: float):
         if not self._out:
-            self.log_message.emit("[Unity] Cannot scan — socket not started")
-            self.devices_found.emit([])
+            self._try_emit(self.log_message, "[Unity] Cannot scan — socket not started")
+            self._try_emit(self.devices_found, [])
             return
 
         with self._scan_lock:
@@ -181,10 +188,10 @@ class UnityHandler(QObject):
                     unicast_targets.append(ip)
 
         total = len(unicast_targets) + len(broadcasts)
-        self.scan_progress.emit(
+        self._try_emit(self.scan_progress, 
             f"Scanning {len(broadcasts)} broadcast + {len(unicast_targets)} unicast addresses..."
         )
-        self.log_message.emit(
+        self._try_emit(self.log_message, 
             f"[Unity] Scanning: {', '.join(broadcasts)}  "
             f"+ {len(unicast_targets)} unicast IPs across {len(subnets)} subnet(s)"
         )
@@ -213,7 +220,7 @@ class UnityHandler(QObject):
                     pass
             # Small pause between batches so listener can process replies
             time.sleep(0.08)
-            self.scan_progress.emit(
+            self._try_emit(self.scan_progress, 
                 f"Probing... {sent}/{len(unicast_targets)} IPs"
             )
 
@@ -229,9 +236,9 @@ class UnityHandler(QObject):
         msg = f"Scan complete — {len(found)} device(s) found."
         if not found:
             msg += "  Try entering the IP manually."
-        self.scan_progress.emit(msg)
-        self.log_message.emit(f"[Unity] {msg}")
-        self.devices_found.emit(found)
+        self._try_emit(self.scan_progress, msg)
+        self._try_emit(self.log_message, f"[Unity] {msg}")
+        self._try_emit(self.devices_found, found)
 
     # ── Connect ───────────────────────────────────────────────────────────────
 
@@ -239,12 +246,12 @@ class UnityHandler(QObject):
         threading.Thread(target=self._do_connect, args=(device,), daemon=True).start()
 
     def _do_connect(self, device: UnityDevice):
-        self.log_message.emit(f"[Unity] Connecting to {device.display_name}...")
+        self._try_emit(self.log_message, f"[Unity] Connecting to {device.display_name}...")
         self._connect_event.clear()
         try:
             self._out.sendto(b"CONNECT", (device.ip, self._port))
         except OSError as e:
-            self.log_message.emit(f"[Unity] Connect failed: {e}")
+            self._try_emit(self.log_message, f"[Unity] Connect failed: {e}")
             return
         # Send CONNECT repeatedly — UDP can be lost, and the first
         # packet may be blocked while the OS firewall dialog is shown.
@@ -252,13 +259,13 @@ class UnityHandler(QObject):
         got = False
         for attempt in range(12):
             if attempt > 0:
-                self.log_message.emit(
+                self._try_emit(self.log_message, 
                     f"[Unity] Retrying CONNECT ({attempt+1}/12)..."
                 )
             try:
                 self._out.sendto(b"CONNECT", (device.ip, self._port))
             except OSError as e:
-                self.log_message.emit(f"[Unity] Send error: {e}")
+                self._try_emit(self.log_message, f"[Unity] Send error: {e}")
                 return
             got = self._connect_event.wait(timeout=0.5)
             if got:
@@ -266,12 +273,12 @@ class UnityHandler(QObject):
 
         if got:
             self._device = device
-            self.status_changed.emit("connected")
-            self.log_message.emit(f"[Unity] Connected to {device.display_name}")
+            self._try_emit(self.status_changed, "connected")
+            self._try_emit(self.log_message, f"[Unity] Connected to {device.display_name}")
             threading.Thread(target=self.start_continuous_calibration, daemon=True).start()
             self.start_data_stream()   # stream at current rate while connected
         else:
-            self.log_message.emit(
+            self._try_emit(self.log_message, 
                 f"[Unity] No response from {device.ip} after 6s.\n"
                 f"  → On the Unity machine ({device.ip}) check:\n"
                 f"     1. macOS: System Settings → Firewall → allow Unity Editor\n"
@@ -290,9 +297,9 @@ class UnityHandler(QObject):
                 pass
         self._device = None
         self.calibrated_latency_ns = -1
-        self.calibration_changed.emit(False)
-        self.status_changed.emit("disconnected")
-        self.log_message.emit("[Unity] Disconnected")
+        self._try_emit(self.calibration_changed, False)
+        self._try_emit(self.status_changed, "disconnected")
+        self._try_emit(self.log_message, "[Unity] Disconnected")
 
     @property
     def is_connected(self) -> bool:
@@ -317,7 +324,7 @@ class UnityHandler(QObject):
             return -1
         try:
             self._out.sendto(label.encode(), (self._device.ip, self._port))
-            self.log_message.emit(f"[Unity] Ping → {self._device.ip}: {label}")
+            self._try_emit(self.log_message, f"[Unity] Ping → {self._device.ip}: {label}")
         except OSError as e:
             logger.warning(f"Unity ping: {e}")
             return -1
@@ -377,14 +384,14 @@ class UnityHandler(QObject):
         samples = sorted(self._rtt_buffer)
         median_rtt = samples[len(samples) // 2]
         self.calibrated_latency_ns = median_rtt // 2
-        self.calibration_changed.emit(True)
+        self._try_emit(self.calibration_changed, True)
 
     def start_continuous_calibration(self):
         """Probe every 5s after 3s initial delay. Updates latency after each sample."""
         if self._continuous_calib_active:
             return
         self._continuous_calib_active = True
-        self.log_message.emit("[Unity] Continuous calibration started (1 probe / 5s)")
+        self._try_emit(self.log_message, "[Unity] Continuous calibration started (1 probe / 5s)")
         time.sleep(3.0)
         probe_n = 0
         while self._running and self._device:
@@ -393,7 +400,7 @@ class UnityHandler(QObject):
             if rtt is not None:
                 self._rtt_buffer.append(rtt)
                 self._update_latency()
-                self.log_message.emit(
+                self._try_emit(self.log_message, 
                     f"[Unity] Probe: RTT={rtt/1e6:.1f}ms  "
                     f"one-way={self.calibrated_latency_ns/1e6:.1f}ms  "
                     f"(n={len(self._rtt_buffer)})"
@@ -406,7 +413,7 @@ class UnityHandler(QObject):
         threading.Thread(target=self._record_calib, daemon=True).start()
 
     def _record_calib(self):
-        self.log_message.emit("[Unity] Record-start calibration (10 probes × 1s)...")
+        self._try_emit(self.log_message, "[Unity] Record-start calibration (10 probes × 1s)...")
         for i in range(10):
             if not self._device:
                 break
@@ -416,7 +423,7 @@ class UnityHandler(QObject):
             time.sleep(1.0)
         self._update_latency()
         self._session_latency_ns = self.calibrated_latency_ns
-        self.log_message.emit(
+        self._try_emit(self.log_message, 
             f"[Unity] Session latency locked: one-way={self._session_latency_ns/1e6:.1f}ms "
             f"(n={len(self._rtt_buffer)} samples)"
         )
@@ -437,7 +444,7 @@ class UnityHandler(QObject):
     def _handle(self, msg: str, src_ip: str):
         # Log every non-DATA message from the connected device so we can trace the chain
         if not msg.startswith("DATA,unity,") and not msg.startswith("HELLO"):
-            self.log_message.emit(f"[Unity] ← {src_ip}: {msg[:60]}")
+            self._try_emit(self.log_message, f"[Unity] ← {src_ip}: {msg[:60]}")
 
         if msg.startswith("HELLO,unity,"):
             name = msg.split(",", 2)[2] if msg.count(",") >= 2 else src_ip
@@ -445,16 +452,16 @@ class UnityHandler(QObject):
             with self._scan_lock:
                 if not any(d.ip == src_ip for d in self._scan_results):
                     self._scan_results.append(dev)
-                    self.log_message.emit(f"[Unity] Found: {dev.display_name}")
-                    self.devices_found.emit(list(self._scan_results))
-                    self.scan_progress.emit(
+                    self._try_emit(self.log_message, f"[Unity] Found: {dev.display_name}")
+                    self._try_emit(self.devices_found, list(self._scan_results))
+                    self._try_emit(self.scan_progress, 
                         f"Found {len(self._scan_results)} device(s): {name} [{src_ip}]"
                     )
 
             # If this HELLO is from our already-connected device (e.g. after domain
             # reload), auto-send CONNECT to restore the handshake without user action
             if self._device and src_ip == self._device.ip:
-                self.log_message.emit(f"[Unity] Known device reconnecting — sending CONNECT")
+                self._try_emit(self.log_message, f"[Unity] Known device reconnecting — sending CONNECT")
                 try:
                     self._out.sendto(b"CONNECT", (src_ip, self._port))
                 except OSError:
@@ -470,7 +477,7 @@ class UnityHandler(QObject):
 
         if msg.startswith("DATA,unity,"):
             self.has_streaming_data = True
-            self.data_received.emit(msg)
+            self._try_emit(self.data_received, msg)
             return
 
         if msg.startswith("RECONNECT,"):
@@ -479,24 +486,24 @@ class UnityHandler(QObject):
             dev  = UnityDevice(ip=src_ip, name=name)
             self._device = dev
             self._connect_event.set()
-            self.status_changed.emit("connected")
-            self.log_message.emit(f"[Unity] Reconnected after domain reload: {dev.display_name}")
+            self._try_emit(self.status_changed, "connected")
+            self._try_emit(self.log_message, f"[Unity] Reconnected after domain reload: {dev.display_name}")
             self.start_data_stream()   # resume streaming after reconnect
             return
 
         if msg == "RECORDING_STARTED":
-            self.log_message.emit(f"[Unity] Recording started — triggering LSL recording")
-            self.recording_started.emit()
+            self._try_emit(self.log_message, f"[Unity] Recording started — triggering LSL recording")
+            self._try_emit(self.recording_started, )
             return
 
         if msg == "RECORDING_STOPPED":
-            self.log_message.emit(f"[Unity] Recording stopped")
-            self.recording_stopped.emit()
+            self._try_emit(self.log_message, f"[Unity] Recording stopped")
+            self._try_emit(self.recording_stopped, )
             return
 
         if msg == "PING":
-            self.log_message.emit(f"[Unity] Ping trigger from {src_ip}")
-            self.ping_requested.emit()
+            self._try_emit(self.log_message, f"[Unity] Ping trigger from {src_ip}")
+            self._try_emit(self.ping_requested, )
         elif msg.startswith("ACK:"):
             # Format: ACK:<ping_id> or ACK:<ping_id>:<unity_ns>
             rest    = msg[4:]
@@ -512,4 +519,4 @@ class UnityHandler(QObject):
 
             # If this is a real ping ACK (not calibration), emit with Unity timestamp
             if ping_id.startswith("ping_") and unity_ns > 0:
-                self.unity_ack_received.emit(ping_id, unity_ns)
+                self._try_emit(self.unity_ack_received, ping_id, unity_ns)

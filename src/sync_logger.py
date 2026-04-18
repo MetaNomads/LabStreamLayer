@@ -110,4 +110,5 @@ class SyncLogger:
 
     @staticmethod
     def make_session_timestamp() -> str:
-        return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+        from zoneinfo import ZoneInfo
+        return datetime.now(tz=ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d_%H-%M-%S")

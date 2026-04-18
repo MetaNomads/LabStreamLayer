@@ -135,6 +135,7 @@ class EmotiBitHandler(QObject):
         super().__init__(parent)
         self._devices:   Dict[str, EmotiBitDevice] = {}
         self._connected: Optional[EmotiBitDevice]  = None
+        self._conn_lock  = threading.Lock()   # guards _connected r/w across threads
         self._status     = EmotiBitStatus.IDLE
         self._pkt_num    = 0
         self._running    = False
@@ -170,11 +171,11 @@ class EmotiBitHandler(QObject):
         self._udp.settimeout(1.0)
         try:
             self._udp.bind(("", EMOTIBIT_PORT))
-            self.log_message.emit(
+            self._try_emit(self.log_message, 
                 f"[EmotiBit] UDP bound to port {EMOTIBIT_PORT}"
             )
         except OSError as e:
-            self.log_message.emit(
+            self._try_emit(self.log_message, 
                 f"[EmotiBit] Cannot bind UDP port {EMOTIBIT_PORT}: {e}\n"
                 f"           Close EmotiBit Oscilloscope first, then restart."
             )
@@ -188,11 +189,11 @@ class EmotiBitHandler(QObject):
         try:
             self._tcp_server.bind(("", TCP_CONTROL_PORT))
             self._tcp_server.listen(2)
-            self.log_message.emit(
+            self._try_emit(self.log_message, 
                 f"[EmotiBit] TCP control server on port {TCP_CONTROL_PORT}"
             )
         except OSError as e:
-            self.log_message.emit(
+            self._try_emit(self.log_message, 
                 f"[EmotiBit] TCP server warning: {e} (commands will use UDP)"
             )
             self._tcp_server = None
@@ -216,7 +217,7 @@ class EmotiBitHandler(QObject):
         self._scanning = True
         self._set_status(EmotiBitStatus.SCANNING)
         broadcasts = get_broadcast_addresses()
-        self.log_message.emit(
+        self._try_emit(self.log_message, 
             f"[EmotiBit] Scanning: {', '.join(broadcasts)}"
         )
 
@@ -229,7 +230,7 @@ class EmotiBitHandler(QObject):
             self._scanning = False
             if self._status == EmotiBitStatus.SCANNING:
                 self._set_status(EmotiBitStatus.IDLE)
-            self.log_message.emit(
+            self._try_emit(self.log_message, 
                 f"[EmotiBit] Scan done - {len(self._devices)} device(s) found"
             )
 
@@ -243,8 +244,8 @@ class EmotiBitHandler(QObject):
         if ip not in self._devices:
             dev = EmotiBitDevice(ip=ip, device_id="(manual)")
             self._devices[ip] = dev
-            self.devices_updated.emit(list(self._devices.values()))
-            self.log_message.emit(f"[EmotiBit] Manual device: {ip}")
+            self._try_emit(self.devices_updated, list(self._devices.values()))
+            self._try_emit(self.log_message, f"[EmotiBit] Manual device: {ip}")
             threading.Thread(
                 target=lambda: self._do_arp(dev), daemon=True
             ).start()
@@ -253,9 +254,10 @@ class EmotiBitHandler(QObject):
     # ── Connection ───────────────────────────────────────────────────────────────
 
     def connect(self, device: EmotiBitDevice):
-        self._connected = device
+        with self._conn_lock:
+            self._connected = device
         self._set_status(EmotiBitStatus.CONNECTED)
-        self.log_message.emit(f"[EmotiBit] Connecting to {device.display_name}")
+        self._try_emit(self.log_message, f"[EmotiBit] Connecting to {device.display_name}")
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         threading.Thread(target=self.start_continuous_calibration, daemon=True).start()
 
@@ -266,7 +268,8 @@ class EmotiBitHandler(QObject):
             self._udp_send(self._pkt("TL", wall_clock), self._connected.ip)
 
     def disconnect(self):
-        self._connected = None
+        with self._conn_lock:
+            self._connected = None
         self._session_latency_ns = -1
         self.has_streaming_data = False
         if self._tcp_client:
@@ -276,52 +279,68 @@ class EmotiBitHandler(QObject):
                 pass
             self._tcp_client = None
         self.calibrated_latency_ns = -1
-        self.calibration_changed.emit(False)
+        self._try_emit(self.calibration_changed, False)
         self._set_status(EmotiBitStatus.IDLE)
-        self.log_message.emit("[EmotiBit] Disconnected")
+        self._try_emit(self.log_message, "[EmotiBit] Disconnected")
 
     # ── Recording & markers ──────────────────────────────────────────────────────
 
-    def check_sd_card(self, timeout: float = 3.0) -> bool:
+    def check_sd_card(self, retries: int = 5, timeout: float = 2.0) -> bool:
         """
-        Send RB probe and wait for device echo to verify SD card is working.
-        Returns True if SD card responded, False if timed out.
-        Does NOT change recording status — the RB echo sets it to RECORDING,
-        so only call this as part of starting a real recording.
+        Send RB and wait for device echo. Retries up to `retries` times.
+        Returns True if SD card confirmed, False after all attempts fail.
+        Each attempt sends a fresh RB packet and waits `timeout` seconds.
+        Total max wait: retries × timeout = 5 × 2s = 10s.
         """
         if not self._connected:
             return False
-        self._rb_event.clear()
-        self.sd_card_ok = None
-        filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-        self._send_ctrl(self._pkt("TL", datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")))
-        time.sleep(0.05)
-        self._send_ctrl(self._pkt("RB", filename))
-        got = self._rb_event.wait(timeout=timeout)
-        if not got:
-            self.sd_card_ok = False
-            self.log_message.emit(
-                "[EmotiBit] ⚠ No SD card response — card may be missing or failed"
+        for attempt in range(1, retries + 1):
+            filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+            self._send_ctrl(self._pkt("TL", datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")))
+            time.sleep(0.05)
+            self._rb_event.clear()
+            self.sd_card_ok = None
+            self._send_ctrl(self._pkt("RB", filename))
+            self._try_emit(self.log_message, 
+                f"[EmotiBit] SD card check attempt {attempt}/{retries}..."
             )
-        return got
+            got = self._rb_event.wait(timeout=timeout)
+            if got:
+                self.sd_card_ok = True
+                return True
+            if not self._connected:
+                return False
+        self.sd_card_ok = False
+        self._try_emit(self.log_message, 
+            "[EmotiBit] ⚠ No SD card response after all attempts"
+        )
+        return False
 
     def start_recording(self):
         """
         Start SD card recording.
-        Probes SD card first — emits log warning if no response.
-        Re-calibrates latency at t=5s in background.
+        Sends RB (Record Begin) up to 3 times to improve UDP delivery reliability.
+        Status transitions to RECORDING when device echoes RB back.
         """
         if not self._connected:
-            self.log_message.emit("[EmotiBit] Not connected")
+            self._try_emit(self.log_message, "[EmotiBit] Not connected")
             return
 
         filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+
+        # Sync device clock first
         self._send_ctrl(self._pkt("TL", datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")))
         time.sleep(0.05)
+
+        # Send RB 3 times — device deduplicates by packet number but
+        # improved reliability over lossy WiFi
+        rb_pkt = self._pkt("RB", filename)
         self._rb_event.clear()
         self.sd_card_ok = None
-        self._send_ctrl(self._pkt("RB", filename))
-        self.log_message.emit(f"[EmotiBit] Recording started: {filename}.csv")
+        for _ in range(3):
+            self._send_ctrl(rb_pkt)
+            time.sleep(0.05)
+        self._try_emit(self.log_message, f"[EmotiBit] RB sent — waiting for device echo: {filename}.csv")
 
     def stop_recording(self):
         """
@@ -336,14 +355,14 @@ class EmotiBitHandler(QObject):
             self._send_ctrl(re_pkt)
             time.sleep(0.05)
         self._set_status(EmotiBitStatus.CONNECTED)
-        self.log_message.emit("[EmotiBit] RE (Record End) sent")
+        self._try_emit(self.log_message, "[EmotiBit] RE (Record End) sent")
 
     def send_marker(self, label: str) -> tuple:
         """
         Send UN (User Note) marker. Returns (send_ns, calibrated_one_way_latency_ns).
         """
         if not self._connected:
-            self.log_message.emit("[EmotiBit] Cannot send marker - not connected")
+            self._try_emit(self.log_message, "[EmotiBit] Cannot send marker - not connected")
             lat = self._session_latency_ns if self._session_latency_ns >= 0 else self.calibrated_latency_ns
             return time.time_ns(), lat
 
@@ -353,7 +372,7 @@ class EmotiBitHandler(QObject):
         self._send_ctrl(pkt)
         self._send_ctrl(pkt)
 
-        self.log_message.emit(f"[EmotiBit] marker sent: {label}")
+        self._try_emit(self.log_message, f"[EmotiBit] marker sent: {label}")
         lat = self._session_latency_ns if self._session_latency_ns >= 0 else self.calibrated_latency_ns
         return send_ns, lat
 
@@ -394,7 +413,7 @@ class EmotiBitHandler(QObject):
         samples = sorted(self._rtt_buffer)
         median_rtt = samples[len(samples) // 2]
         self.calibrated_latency_ns = median_rtt // 2
-        self.calibration_changed.emit(True)
+        self._try_emit(self.calibration_changed, True)
 
     def start_continuous_calibration(self):
         """
@@ -404,14 +423,14 @@ class EmotiBitHandler(QObject):
         if self._continuous_calib_active:
             return
         self._continuous_calib_active = True
-        self.log_message.emit("[EmotiBit] Continuous calibration started (1 probe / 5s)")
+        self._try_emit(self.log_message, "[EmotiBit] Continuous calibration started (1 probe / 5s)")
         time.sleep(3.0)
         while self._running and self._connected:
             rtt = self._single_rtt()
             if rtt is not None:
                 self._rtt_buffer.append(rtt)
                 self._update_latency()
-                self.log_message.emit(
+                self._try_emit(self.log_message, 
                     f"[EmotiBit] Probe: RTT={rtt/1e6:.1f}ms  "
                     f"one-way={self.calibrated_latency_ns/1e6:.1f}ms  "
                     f"(n={len(self._rtt_buffer)})"
@@ -424,7 +443,7 @@ class EmotiBitHandler(QObject):
         threading.Thread(target=self._record_calib, daemon=True).start()
 
     def _record_calib(self):
-        self.log_message.emit("[EmotiBit] Record-start calibration (10 probes × 1s)...")
+        self._try_emit(self.log_message, "[EmotiBit] Record-start calibration (10 probes × 1s)...")
         for _ in range(10):
             if not self._connected:
                 break
@@ -434,7 +453,7 @@ class EmotiBitHandler(QObject):
             time.sleep(1.0)
         self._update_latency()
         self._session_latency_ns = self.calibrated_latency_ns
-        self.log_message.emit(
+        self._try_emit(self.log_message, 
             f"[EmotiBit] Session latency locked: one-way={self._session_latency_ns/1e6:.1f}ms "
             f"(n={len(self._rtt_buffer)} samples)"
         )
@@ -496,10 +515,10 @@ class EmotiBitHandler(QObject):
         """
         Send EC heartbeat every 1 s with CP and DP payload labels.
         Sends TL (Timestamp Local) immediately on first beat, then every 5 s.
-        This matches Oscilloscope behaviour and ensures the device clock is
-        always up to date for accurate filenames and timestamps.
+        If the device drops, attempts to auto-reconnect every 5s.
         """
         tl_counter = 0
+        last_device = self._connected
         while self._running and self._connected:
             # EC heartbeat
             payload = f"CP,{TCP_CONTROL_PORT},DP,{UDP_DATA_PORT}"
@@ -513,6 +532,24 @@ class EmotiBitHandler(QObject):
 
             tl_counter += 1
             time.sleep(HEARTBEAT_INTERVAL)
+
+        # Device dropped — attempt auto-reconnect
+        if self._running and not self._connected and last_device:
+            self._try_emit(self.log_message, 
+                f"[EmotiBit] Connection lost — auto-reconnecting to {last_device.ip}..."
+            )
+            threading.Thread(
+                target=self._auto_reconnect, args=(last_device,), daemon=True
+            ).start()
+
+    def _auto_reconnect(self, device):
+        """Retry connecting to a dropped device every 5s until success or stop()."""
+        while self._running and not self._connected:
+            time.sleep(5.0)
+            if not self._running:
+                break
+            self._try_emit(self.log_message, f"[EmotiBit] Reconnecting to {device.ip}...")
+            self.connect(device)
 
     # ── Receive loops ─────────────────────────────────────────────────────────────
 
@@ -533,7 +570,7 @@ class EmotiBitHandler(QObject):
             try:
                 conn, addr = self._tcp_server.accept()
                 self._tcp_client = conn
-                self.log_message.emit(
+                self._try_emit(self.log_message, 
                     f"[EmotiBit] TCP back-channel from {addr[0]}"
                 )
                 threading.Thread(
@@ -560,7 +597,7 @@ class EmotiBitHandler(QObject):
                 break
         if self._tcp_client is conn:
             self._tcp_client = None
-        self.log_message.emit("[EmotiBit] TCP back-channel closed")
+        self._try_emit(self.log_message, "[EmotiBit] TCP back-channel closed")
 
     # ── Packet parsing ────────────────────────────────────────────────────────────
 
@@ -615,8 +652,8 @@ class EmotiBitHandler(QObject):
                     ip=ip, data_port=data_port, device_id=device_id
                 )
                 self._devices[ip] = dev
-                self.devices_updated.emit(list(self._devices.values()))
-                self.log_message.emit(
+                self._try_emit(self.devices_updated, list(self._devices.values()))
+                self._try_emit(self.log_message, 
                     f"[EmotiBit] Found: {dev.display_name}"
                 )
                 threading.Thread(
@@ -629,25 +666,25 @@ class EmotiBitHandler(QObject):
             self.sd_card_ok = True
             self._rb_event.set()
             self._set_status(EmotiBitStatus.RECORDING)
-            self.log_message.emit(
+            self._try_emit(self.log_message, 
                 f"[EmotiBit] Recording started: {filename}"
             )
 
         elif tag == "RE":
             if self._status == EmotiBitStatus.RECORDING:
                 self._set_status(EmotiBitStatus.CONNECTED)
-                self.log_message.emit("[EmotiBit] Recording stopped")
+                self._try_emit(self.log_message, "[EmotiBit] Recording stopped")
 
         elif tag == "EM":
             # Device status update — log it
-            self.log_message.emit(f"[EmotiBit] Status: {','.join(parts[6:])}")
+            self._try_emit(self.log_message, f"[EmotiBit] Status: {','.join(parts[6:])}")
 
         elif tag == "B%":
             # Battery percent — direct 0-100 value
             try:
                 if len(parts) > 6 and parts[6]:
                     pct = round(float(parts[6]))
-                    self.battery_changed.emit(max(0, min(100, pct)))
+                    self._try_emit(self.battery_changed, max(0, min(100, pct)))
             except (ValueError, IndexError):
                 pass
 
@@ -657,7 +694,7 @@ class EmotiBitHandler(QObject):
                 if len(parts) > 6 and parts[6]:
                     v = float(parts[6])
                     pct = round(max(0.0, min(1.0, (v - 3.5) / 0.7)) * 100)
-                    self.battery_changed.emit(pct)
+                    self._try_emit(self.battery_changed, pct)
             except (ValueError, IndexError):
                 pass
 
@@ -667,7 +704,7 @@ class EmotiBitHandler(QObject):
                 for v in parts[6:]:
                     if v:
                         self.has_streaming_data = True
-                        self.ppg_red_sample.emit(float(v))
+                        self._try_emit(self.ppg_red_sample, float(v))
             except (ValueError, IndexError):
                 pass
 
@@ -675,7 +712,7 @@ class EmotiBitHandler(QObject):
             # Heart rate — single value
             try:
                 if len(parts) > 6 and parts[6]:
-                    self.hr_sample.emit(float(parts[6]))
+                    self._try_emit(self.hr_sample, float(parts[6]))
             except (ValueError, IndexError):
                 pass
 
@@ -685,10 +722,17 @@ class EmotiBitHandler(QObject):
         mac = arp_mac_lookup(dev.ip)
         if mac:
             dev.mac = mac
-            self.devices_updated.emit(list(self._devices.values()))
-            self.log_message.emit(f"[EmotiBit] MAC {dev.ip} -> {mac}")
+            self._try_emit(self.devices_updated, list(self._devices.values()))
+            self._try_emit(self.log_message, f"[EmotiBit] MAC {dev.ip} -> {mac}")
+
+    def _try_emit(self, signal, *args):
+        """Safely emit a signal from any thread. Guards against deleted QObject."""
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            pass
 
     def _set_status(self, s: EmotiBitStatus):
         if s != self._status:
             self._status = s
-            self.status_changed.emit(s)
+            self._try_emit(self.status_changed, s)

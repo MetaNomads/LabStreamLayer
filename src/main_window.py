@@ -5,6 +5,7 @@ gui/main_window.py  -  dark industrial design
 import socket
 import traceback
 import time
+import threading
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -171,6 +172,7 @@ class StreamGraph(QWidget):
         self.setStyleSheet(
             f"background:#0d0f18;border:1px solid {BDR};border-radius:4px;"
         )
+        self._lock = threading.Lock()
         self._redraw_timer = QTimer(self)
         self._redraw_timer.setInterval(50)
         self._redraw_timer.timeout.connect(self.update)
@@ -181,14 +183,18 @@ class StreamGraph(QWidget):
 
     def push(self, value: float):
         now = time.monotonic()
-        self._data.append((now, value))
-        self._has_data = True
-        # Trim old data
-        cutoff = now - self._window - 0.5
-        while self._data and self._data[0][0] < cutoff:
-            self._data.popleft()
+        with self._lock:
+            self._data.append((now, value))
+            self._has_data = True
+            # Trim old data
+            cutoff = now - self._window - 0.5
+            while self._data and self._data[0][0] < cutoff:
+                self._data.popleft()
 
     def paintEvent(self, event):
+        with self._lock:
+            data_snapshot = list(self._data)
+            has_data = self._has_data
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
@@ -204,14 +210,14 @@ class StreamGraph(QWidget):
         painter.setFont(f)
         painter.drawText(pad_l, 10, self._label)
 
-        if not self._has_data:
+        if not has_data:
             painter.setPen(QColor(DIM))
             painter.drawText(w // 2 - 16, h // 2 + 4, "no data")
             return
 
         now = time.monotonic()
         cutoff = now - self._window
-        pts = [(t, v) for t, v in self._data if t >= cutoff]
+        pts = [(t, v) for t, v in data_snapshot if t >= cutoff]
 
         if len(pts) < 2:
             return

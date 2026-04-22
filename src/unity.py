@@ -99,7 +99,7 @@ class UnityHandler(QObject):
         self._try_emit(self.log_message, f"[Unity] Listening on UDP port {self._port}")
 
     def _try_emit(self, signal, *args):
-        """Safely emit a signal from any thread. Guards against deleted QObject."""
+        """Safely emit a signal from any thread."""
         try:
             signal.emit(*args)
         except RuntimeError:
@@ -493,17 +493,17 @@ class UnityHandler(QObject):
 
         if msg == "RECORDING_STARTED":
             self._try_emit(self.log_message, f"[Unity] Recording started — triggering LSL recording")
-            self._try_emit(self.recording_started, )
+            self._try_emit(self.recording_started)
             return
 
         if msg == "RECORDING_STOPPED":
             self._try_emit(self.log_message, f"[Unity] Recording stopped")
-            self._try_emit(self.recording_stopped, )
+            self._try_emit(self.recording_stopped)
             return
 
         if msg == "PING":
             self._try_emit(self.log_message, f"[Unity] Ping trigger from {src_ip}")
-            self._try_emit(self.ping_requested, )
+            self._try_emit(self.ping_requested)
         elif msg.startswith("ACK:"):
             # Format: ACK:<ping_id> or ACK:<ping_id>:<unity_ns>
             rest    = msg[4:]

@@ -160,7 +160,7 @@ class PolarHandler(QObject):
         while client.is_connected:
             try:
                 t1 = time.time_ns()
-                await client.write_gatt_char(PMD_CONTROL, ECG_SETTINGS, response=True)
+                await client.read_gatt_char(BATTERY_CHAR)
                 rtt = time.time_ns() - t1
                 self._rtt_buffer.append(rtt)
                 self._update_latency()
@@ -193,7 +193,6 @@ class PolarHandler(QObject):
             self._loop.call_soon_threadsafe(self._cmd_queue.put_nowait, cmd)
 
     def _try_emit(self, signal, *args):
-        """Safely emit a signal from any thread. Guards against deleted QObject."""
         try:
             signal.emit(*args)
         except RuntimeError:
@@ -263,16 +262,22 @@ class PolarHandler(QObject):
                     off += 2
 
         def on_disconnect(c: BleakClient):
-            self._try_emit(self.log_message, "[Polar] Device disconnected — scheduling reconnect in 3s")
+            self._try_emit(self.log_message, "[Polar] Device disconnected — will retry in 5s")
             self._set_status(PolarStatus.IDLE)
-            # Auto-reconnect: re-queue the same device after a short delay
-            import asyncio as _asyncio
-            async def _reconnect():
-                await _asyncio.sleep(3.0)
-                if self._status == PolarStatus.IDLE and device:
-                    self._try_emit(self.log_message, "[Polar] Auto-reconnecting...")
-                    await self._cmd_queue.put(("connect", device))
-            _asyncio.ensure_future(_reconnect())
+            # Schedule reconnect via the asyncio loop (not ensure_future from sync context)
+            if self._loop and self._loop.is_running():
+                self._loop.call_later(5.0, lambda: self._loop.create_task(
+                    self._cmd_queue.put(("connect", device))
+                ) if device else None)
+
+        async def keepalive(client):
+            """Read battery every 10s to prevent CoreBluetooth idle timeout."""
+            while client.is_connected:
+                try:
+                    await client.read_gatt_char(BATTERY_CHAR)
+                except Exception:
+                    pass
+                await asyncio.sleep(10.0)
 
         while True:
             cmd = await self._cmd_queue.get()
@@ -309,7 +314,7 @@ class PolarHandler(QObject):
                     self._try_emit(self.log_message, f"[Polar] Scan complete — {len(found)} device(s)")
                 except Exception as e:
                     self._try_emit(self.log_message, f"[Polar] Scan error: {e}")
-                self.devices_found.emit(found)
+                self._try_emit(self.devices_found, found)
                 self._set_status(PolarStatus.IDLE)
 
             elif action == "connect":
@@ -374,6 +379,8 @@ class PolarHandler(QObject):
                         pass
                     # Start continuous calibration probe every 5s
                     asyncio.ensure_future(self._continuous_probe(client))
+                    # Keepalive to prevent CoreBluetooth idle timeout
+                    asyncio.ensure_future(keepalive(client))
 
                 except Exception as e:
                     self._try_emit(self.log_message, f"[Polar] Connect failed: {e}")

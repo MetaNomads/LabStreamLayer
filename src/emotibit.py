@@ -152,6 +152,24 @@ class EmotiBitHandler(QObject):
         # RB echo signalling for SD card check
         self._rb_event   = threading.Event()
         self.sd_card_ok: Optional[bool] = None  # None=unknown, True=ok, False=failed
+        self._is_writing:         bool = False
+        self._recording_start_ns: int  = 0
+        self._last_writing_ns:    int  = 0    # time.time_ns() when is_writing last confirmed True
+
+    @property
+    def is_writing(self) -> bool:
+        return self._is_writing
+
+    @property
+    def seconds_since_last_writing_confirmation(self) -> float:
+        """Seconds since EM RS=RB was last received. 0 if never confirmed."""
+        if self._last_writing_ns == 0: return 0.0
+        return (time.time_ns() - self._last_writing_ns) / 1e9
+
+    @property
+    def seconds_since_recording_start(self) -> float:
+        if self._recording_start_ns == 0: return 0.0
+        return (time.time_ns() - self._recording_start_ns) / 1e9
         self._rtt_buffer = deque(maxlen=20)      # rolling RTT samples
         self._continuous_calib_active = False
         self._session_latency_ns: int = -1        # locked at record-start calibration
@@ -272,6 +290,9 @@ class EmotiBitHandler(QObject):
             self._connected = None
         self._session_latency_ns = -1
         self.has_streaming_data = False
+        self._is_writing = False
+        self._recording_start_ns = 0
+        self._last_writing_ns = 0
         if self._tcp_client:
             try:
                 self._tcp_client.close()
@@ -340,6 +361,7 @@ class EmotiBitHandler(QObject):
         for _ in range(3):
             self._send_ctrl(rb_pkt)
             time.sleep(0.05)
+        self._recording_start_ns = time.time_ns()
         self._try_emit(self.log_message, f"[EmotiBit] RB sent — waiting for device echo: {filename}.csv")
 
     def stop_recording(self):
@@ -676,8 +698,20 @@ class EmotiBitHandler(QObject):
                 self._try_emit(self.log_message, "[EmotiBit] Recording stopped")
 
         elif tag == "EM":
-            # Device status update — log it
-            self._try_emit(self.log_message, f"[EmotiBit] Status: {','.join(parts[6:])}")
+            # Device status update — parse RS (Recording Status)
+            payload = ','.join(parts[6:])
+            self._try_emit(self.log_message, f"[EmotiBit] Status: {payload}")
+            # RS=RB means device is actively writing to SD card
+            # RS=RE means recording stopped
+            parts_map = payload.split(',')
+            for i in range(len(parts_map) - 1):
+                if parts_map[i] == "RS":
+                    if parts_map[i+1] == "RB":
+                        self._is_writing = True
+                        self._last_writing_ns = time.time_ns()
+                    elif parts_map[i+1] == "RE":
+                        self._is_writing = False
+                    break
 
         elif tag == "B%":
             # Battery percent — direct 0-100 value

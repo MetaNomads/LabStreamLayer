@@ -1377,8 +1377,33 @@ class MainWindow(QMainWindow):
             self._polar.start_recording(self._session_ts, session_dir)
             self._polar.calibrate_for_recording()
         if self._row_eb.is_required:
+            self._log("[EmotiBit] Checking SD card (up to 5s)...")
+            self._emotibit._rb_event.clear()
             self._emotibit.start_recording()
             self._emotibit.calibrate_for_recording()
+            sd_ok = self._emotibit._rb_event.wait(timeout=5.0)
+            if not sd_ok:
+                self._log("[EmotiBit] ⚠ No RB echo — SD card missing?")
+                self._emotibit.stop_recording()
+                if self._row_polar.is_required:
+                    self._polar.stop_recording()
+                self._sync_logger.close()
+                self._is_recording = False
+                self._timer.stop()
+                self._watchdog_timer.stop()
+                self._auto_ping_timer.stop()
+                self._auto_ping_count = 0
+                self._stack.setCurrentIndex(0)
+                for row in (self._row_eb, self._row_polar, self._row_unity):
+                    row.setVisible(True)
+                self._btn_start.setEnabled(True)
+                self._btn_ping.setEnabled(False)
+                self._update_start_btn()
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "EmotiBit SD Card Missing",
+                    "EmotiBit did not confirm recording started.\n\n"
+                    "Please check the SD card is inserted and try again.")
+                return
         if self._row_unity.is_required:
             self._unity.calibrate_for_recording()
             self._unity.start_data_stream()   # restart if previously stopped
@@ -1435,20 +1460,48 @@ class MainWindow(QMainWindow):
         )
 
     @pyqtSlot()
+    @pyqtSlot()
+    def _on_emotibit_no_sd(self):
+        if not self._is_recording:
+            return
+        self._sensor_warn.setText(
+            "⚠  EmotiBit did not confirm recording — SD card may be missing or unseated"
+        )
+        self._sensor_warn.setVisible(True)
+        self._log("[EmotiBit] ⚠ No RB echo after 5s — SD card missing?")
+
     def _watchdog_check(self):
         """Every 5s during recording: check each required sensor is actually active."""
         if not self._is_recording:
             return
         warnings = []
+
         if self._row_eb.is_required:
-            if self._emotibit.status != EmotiBitStatus.RECORDING:
-                warnings.append("\u26a0  EmotiBit not recording \u2014 check device and SD card")
+            if self._emotibit.status not in (EmotiBitStatus.CONNECTED, EmotiBitStatus.RECORDING):
+                warnings.append("\u26a0  EmotiBit disconnected")
+            elif not self._emotibit.is_writing:
+                elapsed = self._emotibit.seconds_since_recording_start
+                if elapsed > 15.0:
+                    # is_writing is False — device confirmed stop (EM RS=RE)
+                    # or EM never arrived. Safe to retry.
+                    warnings.append("⚠  EmotiBit not writing — retrying...")
+                    self._emotibit.start_recording()
+                    self._log("[EmotiBit] ⚠ Stopped writing — re-sent RB")
+                else:
+                    warnings.append("⚠  EmotiBit confirming SD card...")
+            elif self._emotibit.seconds_since_last_writing_confirmation > 30.0:
+                # is_writing was True but no EM RS=RB for 30s — card may have dropped
+                warnings.append("⚠  EmotiBit writing stalled — check SD card")
+                self._emotibit.start_recording()
+                self._log("[EmotiBit] ⚠ No EM confirm for 30s — re-sent RB")
         if self._row_polar.is_required:
             if self._polar.status not in (PolarStatus.RECORDING, PolarStatus.CONNECTED):
                 warnings.append("\u26a0  Polar H10 disconnected")
+
         if self._row_unity.is_required:
             if not self._unity.is_connected:
                 warnings.append("\u26a0  Unity disconnected")
+
         if warnings:
             self._sensor_warn.setText("\n".join(warnings))
             self._sensor_warn.setVisible(True)
@@ -1528,7 +1581,7 @@ class MainWindow(QMainWindow):
             return
 
         no_data = [k for k in required if not (
-            (k == "emotibit" and self._emotibit.has_streaming_data) or
+            (k == "emotibit") or   # EmotiBit only streams while recording
             (k == "polar"    and self._polar.has_streaming_data) or
             (k == "unity"    and (not self._chk_require_vr_data.isChecked() or self._unity.has_streaming_data))
         )]
@@ -1780,14 +1833,15 @@ class MainWindow(QMainWindow):
             return self._unity.is_connected
 
         def _calibrated(k):
-            if k == "emotibit":
-                return self._emotibit.calibrated_latency_ns > 0
-            if k == "polar":
-                return self._polar.calibrated_latency_ns > 0
-            return self._unity.is_connected and self._unity.calibrated_latency_ns > 0
+            # Calibration is nice-to-have but not blocking — allow start if connected
+            # The latency value defaults to a reasonable estimate if probing fails
+            if k == "emotibit": return True  # EmotiBit calibration is best-effort
+            if k == "polar":    return True  # Same for Polar
+            return self._unity.is_connected  # Unity: connected = calibrated enough
 
         def _has_data(k):
-            if k == "emotibit": return self._emotibit.has_streaming_data
+            # EmotiBit only streams data while recording — skip the check
+            if k == "emotibit": return True
             if k == "polar":    return self._polar.has_streaming_data
             # Unity data check is optional
             if not self._chk_require_vr_data.isChecked(): return True

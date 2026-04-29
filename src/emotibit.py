@@ -38,6 +38,8 @@ from typing import Dict, List, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from contracts import requires, ensures, Contract
+
 logger = logging.getLogger(__name__)
 
 EMOTIBIT_PORT      = 3131
@@ -130,6 +132,7 @@ class EmotiBitHandler(QObject):
     hr_sample           = pyqtSignal(float)   # HR typetag — heart rate bpm
     calibration_changed = pyqtSignal(bool)    # True = calibrated, False = reset
     battery_changed     = pyqtSignal(int)     # 0-100 percent
+    sensor_event        = pyqtSignal(str)     # "sensor_lost" | "sensor_recovered" | "given_up"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -155,6 +158,25 @@ class EmotiBitHandler(QObject):
         self._is_writing:         bool = False
         self._recording_start_ns: int  = 0
         self._last_writing_ns:    int  = 0    # time.time_ns() when is_writing last confirmed True
+        # NOTE: these three were previously parked after a `return` in the
+        # `seconds_since_recording_start` property and never executed — leaving
+        # _rtt_buffer / _continuous_calib_active / _session_latency_ns undefined
+        # and silently killing the calibration thread. They live in __init__ now.
+        self._rtt_buffer              = deque(maxlen=20)   # rolling RTT samples
+        self._continuous_calib_active = False
+        self._session_latency_ns: int = -1                  # locked at record-start
+        self._last_sample_ns:     int = 0                   # for silent-stream watchdog
+        self._reconnect_attempts: int = 0
+        self._reconnect_max:      int = 10
+        self._given_up:           bool = False              # surfaced as DEGRADED banner
+        # Shutdown signalling — replaces blocking time.sleep in retry loops so
+        # the app doesn't hang for up to 60 s on quit during a long backoff.
+        self._shutdown_event      = threading.Event()
+        # Liveness watchdog — clears _connected after this many seconds of
+        # silence, which is the ONLY path that triggers the auto-reconnect
+        # mechanism (without this, the heartbeat blindly sends UDP to a ghost
+        # device forever and bounded retry never actually retries).
+        self._liveness_silence_s: float = 10.0
 
     @property
     def is_writing(self) -> bool:
@@ -170,9 +192,36 @@ class EmotiBitHandler(QObject):
     def seconds_since_recording_start(self) -> float:
         if self._recording_start_ns == 0: return 0.0
         return (time.time_ns() - self._recording_start_ns) / 1e9
-        self._rtt_buffer = deque(maxlen=20)      # rolling RTT samples
-        self._continuous_calib_active = False
-        self._session_latency_ns: int = -1        # locked at record-start calibration
+
+    @property
+    def seconds_since_last_sample(self) -> float:
+        """Seconds since the most recent data sample (PR/HR/etc.). 0 if never received."""
+        if self._last_sample_ns == 0: return 0.0
+        return (time.time_ns() - self._last_sample_ns) / 1e9
+
+    @property
+    def effective_latency_ns(self) -> int:
+        """Public latency: locked session value if available, else rolling probe value."""
+        return self._session_latency_ns if self._session_latency_ns >= 0 else self.calibrated_latency_ns
+
+    @property
+    def given_up(self) -> bool:
+        return self._given_up
+
+    @ensures(lambda result, *_args, **_kw: isinstance(result, dict),
+             "public_summary must return a dict")
+    def public_summary(self) -> dict:
+        """Honest snapshot of handler state for session_meta.json — no
+        private-attribute reach-arounds from callers."""
+        with self._conn_lock:
+            dev = self._connected
+        return {
+            "ip":        dev.ip if dev else None,
+            "device_id": dev.device_id if dev else None,
+            "mac":       dev.mac if dev else None,
+            "session_latency_ns": self.effective_latency_ns,
+            "given_up":  self._given_up,
+        }
 
     # ── Lifecycle ────────────────────────────────────────────────────────────────
 
@@ -221,6 +270,7 @@ class EmotiBitHandler(QObject):
 
     def stop(self):
         self._running = False
+        self._shutdown_event.set()   # wake any sleeping retry/liveness loops
         for s in (self._udp, self._tcp_server, self._tcp_client):
             if s:
                 try:
@@ -254,6 +304,10 @@ class EmotiBitHandler(QObject):
 
         threading.Thread(target=_loop, daemon=True).start()
 
+    def add_manual_device(self, ip: str) -> Optional[EmotiBitDevice]:
+        """Public alias — preferred name. `add_manual` is kept as a back-compat shim."""
+        return self.add_manual(ip)
+
     def add_manual(self, ip: str) -> Optional[EmotiBitDevice]:
         try:
             socket.inet_aton(ip)
@@ -271,13 +325,60 @@ class EmotiBitHandler(QObject):
 
     # ── Connection ───────────────────────────────────────────────────────────────
 
+    @requires(lambda self, device: device is not None and bool(getattr(device, "ip", "")),
+              "device must be non-None and have a non-empty ip")
     def connect(self, device: EmotiBitDevice):
+        was_given_up = self._given_up
         with self._conn_lock:
             self._connected = device
+        self._given_up = False
+        self._last_sample_ns = 0   # reset so liveness watchdog gives the link a chance to start
         self._set_status(EmotiBitStatus.CONNECTED)
         self._try_emit(self.log_message, f"[EmotiBit] Connecting to {device.display_name}")
+        # Heartbeat exits whenever _connected becomes None, so a new one is needed
+        # per connect. Calibration is gated so we don't spawn duplicates.
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-        threading.Thread(target=self.start_continuous_calibration, daemon=True).start()
+        if not self._continuous_calib_active:
+            threading.Thread(target=self.start_continuous_calibration, daemon=True).start()
+        # Liveness watchdog — only one ever runs (gated by attribute).
+        if not getattr(self, "_liveness_started", False):
+            self._liveness_started = True
+            threading.Thread(target=self._liveness_loop, daemon=True).start()
+        if was_given_up:
+            # Coming back from DEGRADED state via a successful manual reconnect.
+            self._try_emit(self.sensor_event, "sensor_recovered")
+
+    def _liveness_loop(self):
+        """
+        The ONLY path that detects an EmotiBit going offline. The heartbeat
+        blindly fires UDP and never observes responses, so without this loop the
+        handler stays in 'connected' forever after the device drops, and the
+        bounded auto-reconnect (which fires on _connected becoming None) is
+        never reached.
+        Checks every 2s; if there has been a sample at all (i.e. _last_sample_ns
+        != 0) and silence exceeds _liveness_silence_s, clears _connected, which
+        cascades into the heartbeat loop exiting and _auto_reconnect kicking in.
+        """
+        while self._running:
+            if self._shutdown_event.wait(timeout=2.0):
+                return
+            if not self._connected:
+                continue
+            # Only declare "lost" if we have ever received a sample in this
+            # session — otherwise we're in the startup phase before data flows.
+            if self._last_sample_ns == 0:
+                continue
+            silence = (time.time_ns() - self._last_sample_ns) / 1e9
+            if silence > self._liveness_silence_s:
+                self._try_emit(self.log_message,
+                    f"[EmotiBit] Liveness watchdog: no sample for {silence:.1f}s "
+                    f"(threshold {self._liveness_silence_s:.0f}s) — clearing _connected to trigger reconnect"
+                )
+                self._try_emit(self.sensor_event, "sensor_lost")
+                with self._conn_lock:
+                    self._connected = None
+                # The heartbeat loop will now exit on its next iteration and
+                # spawn _auto_reconnect via the existing path.
 
     def _send_tl_now(self):
         """Send TL immediately (called on connect and before recording)."""
@@ -337,6 +438,8 @@ class EmotiBitHandler(QObject):
         )
         return False
 
+    @requires(lambda self: self._running,
+              "EmotiBit handler must be running (call start() first)")
     def start_recording(self):
         """
         Start SD card recording.
@@ -379,6 +482,11 @@ class EmotiBitHandler(QObject):
         self._set_status(EmotiBitStatus.CONNECTED)
         self._try_emit(self.log_message, "[EmotiBit] RE (Record End) sent")
 
+    @requires(lambda self, label: isinstance(label, str) and len(label) > 0,
+              "marker label must be a non-empty string")
+    @ensures(lambda result, *_args, **_kw: (isinstance(result, tuple) and len(result) == 2
+                                 and isinstance(result[0], int)),
+             "send_marker must return (send_ns:int, latency_ns)")
     def send_marker(self, label: str) -> tuple:
         """
         Send UN (User Note) marker. Returns (send_ns, calibrated_one_way_latency_ns).
@@ -564,14 +672,53 @@ class EmotiBitHandler(QObject):
                 target=self._auto_reconnect, args=(last_device,), daemon=True
             ).start()
 
+    # Backoff schedule for auto-reconnect (seconds). After this many attempts
+    # we surface a persistent DEGRADED banner and stop spinning.
+    _RECONNECT_BACKOFF_S = (5, 10, 20, 40, 60, 60, 60, 60, 60, 60)
+
     def _auto_reconnect(self, device):
-        """Retry connecting to a dropped device every 5s until success or stop()."""
-        while self._running and not self._connected:
-            time.sleep(5.0)
+        """
+        Bounded retry with exponential backoff using shutdown-aware waits.
+        Emits sensor_event("sensor_lost") on entry and sensor_event("given_up")
+        on exhaustion so the host can write rows into the syncLog (the operator
+        log alone is not persistent).
+        """
+        self._try_emit(self.log_message, "[EmotiBit] sensor_lost — bounded reconnect started")
+        self._try_emit(self.sensor_event, "sensor_lost")
+        self._reconnect_attempts = 0
+        for delay in self._RECONNECT_BACKOFF_S:
+            # Shutdown-aware wait — quitting during a 60s backoff exits in <100ms.
+            if self._shutdown_event.wait(timeout=delay):
+                return
             if not self._running:
-                break
-            self._try_emit(self.log_message, f"[EmotiBit] Reconnecting to {device.ip}...")
+                return
+            if self._connected:
+                # Reconnected through some other path (e.g. manual user click).
+                self._try_emit(self.log_message, "[EmotiBit] sensor_recovered (external)")
+                self._try_emit(self.sensor_event, "sensor_recovered")
+                self._given_up = False
+                return
+            self._reconnect_attempts += 1
+            self._try_emit(self.log_message,
+                f"[EmotiBit] Reconnect attempt {self._reconnect_attempts}/"
+                f"{len(self._RECONNECT_BACKOFF_S)} → {device.ip}"
+            )
             self.connect(device)
+            # connect() sets _connected immediately (faith-based for now). The
+            # liveness loop will catch the device if it's still actually offline
+            # and clear _connected again, dropping us back into this loop.
+            # Pause briefly between connect() and next-iteration's connected check
+            # to give the liveness loop a chance to invalidate a faux-success.
+            if self._shutdown_event.wait(timeout=2.0):
+                return
+        # Backoff exhausted
+        if not self._connected and self._running:
+            self._given_up = True
+            self._try_emit(self.log_message,
+                "[EmotiBit] ⚠ DEGRADED — gave up reconnecting after "
+                f"{len(self._RECONNECT_BACKOFF_S)} attempts. Recording continues without EmotiBit."
+            )
+            self._try_emit(self.sensor_event, "given_up")
 
     # ── Receive loops ─────────────────────────────────────────────────────────────
 
@@ -638,9 +785,14 @@ class EmotiBitHandler(QObject):
         tag = parts[3]
 
         if tag == "HH":
-            # Signal any waiting calibration probe
-            self._hh_recv_ns = time.time_ns()
-            self._hh_event.set()
+            # Only signal the calibration waiter when the HH is from the device
+            # we are currently connected to. Otherwise a second EmotiBit on the
+            # same lab subnet (very common) contaminates the RTT measurement.
+            with self._conn_lock:
+                connected_ip = self._connected.ip if self._connected else None
+            if connected_ip is None or ip == connected_ip:
+                self._hh_recv_ns = time.time_ns()
+                self._hh_event.set()
 
         if tag == "HH" and ip:
             # Parse CP, DP, DI from payload labels
@@ -709,6 +861,10 @@ class EmotiBitHandler(QObject):
                     if parts_map[i+1] == "RB":
                         self._is_writing = True
                         self._last_writing_ns = time.time_ns()
+                        # An EM packet is also evidence the device is alive on
+                        # the wire — keep the liveness loop from firing while
+                        # data is paused but heartbeat is healthy.
+                        self._last_sample_ns = time.time_ns()
                     elif parts_map[i+1] == "RE":
                         self._is_writing = False
                     break
@@ -738,6 +894,7 @@ class EmotiBitHandler(QObject):
                 for v in parts[6:]:
                     if v:
                         self.has_streaming_data = True
+                        self._last_sample_ns = time.time_ns()
                         self._try_emit(self.ppg_red_sample, float(v))
             except (ValueError, IndexError):
                 pass
@@ -746,6 +903,7 @@ class EmotiBitHandler(QObject):
             # Heart rate — single value
             try:
                 if len(parts) > 6 and parts[6]:
+                    self._last_sample_ns = time.time_ns()
                     self._try_emit(self.hr_sample, float(parts[6]))
             except (ValueError, IndexError):
                 pass

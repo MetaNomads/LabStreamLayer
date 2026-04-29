@@ -13,9 +13,27 @@ from PyQt6.QtWidgets import QApplication
 from main_window import MainWindow
 
 
+APP_VERSION = "0.2.0"   # bump on user-visible changes
+
+
+def _git_sha() -> str:
+    try:
+        import subprocess
+        repo = os.path.dirname(os.path.abspath(__file__))
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=repo, timeout=2
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
 def main():
+    print(
+        f"[LabStreamLayer] v{APP_VERSION}  build {_git_sha()}  "
+        f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    )
     app = QApplication(sys.argv)
-    app.setApplicationName("Lab Stream Layer")
+    app.setApplicationName(f"Lab Stream Layer v{APP_VERSION}")
     app.setStyleSheet("""
         QMainWindow, QWidget {
             font-family: -apple-system, "Segoe UI", Arial, sans-serif;

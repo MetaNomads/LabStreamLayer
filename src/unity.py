@@ -24,6 +24,8 @@ from typing import Dict, List, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from contracts import requires, ensures, Contract
+
 logger = logging.getLogger(__name__)
 DEFAULT_PORT      = 12345
 BROADCAST_ADDRESS = "255.255.255.255"
@@ -52,6 +54,7 @@ class UnityHandler(QObject):
     recording_started   = pyqtSignal()      # Unity recorder started → LSL should start too
     recording_stopped   = pyqtSignal()      # Unity recorder stopped
     unity_ack_received  = pyqtSignal(str, object)  # (ping_id, unity_epoch_ns as int)
+    headset_state_changed = pyqtSignal(str)  # "headset_doffed" | "headset_donned"
 
     def __init__(self, port: int = DEFAULT_PORT, parent=None):
         super().__init__(parent)
@@ -72,6 +75,29 @@ class UnityHandler(QObject):
         self._continuous_calib_active = False
         self._session_latency_ns: int = -1   # locked at record-start calibration
         self._stream_interval: float = 1.0   # seconds between REQUEST_DATA
+        self._last_sample_ns: int = 0        # for silent-stream watchdog
+        self._stop_event = threading.Event() # poll-loop stop signal (replaces sleep race)
+
+    @property
+    def seconds_since_last_sample(self) -> float:
+        if self._last_sample_ns == 0: return 0.0
+        return (time.time_ns() - self._last_sample_ns) / 1e9
+
+    @property
+    def effective_latency_ns(self) -> int:
+        return self._session_latency_ns if self._session_latency_ns >= 0 else self.calibrated_latency_ns
+
+    @ensures(lambda result, *_args, **_kw: isinstance(result, dict),
+             "public_summary must return a dict")
+    def public_summary(self) -> dict:
+        """Honest snapshot for session_meta.json — replaces direct
+        `_unity._session_latency_ns` / `_device.ip` reach-arounds."""
+        return {
+            "ip":                 self._device.ip if self._device else None,
+            "name":               self._device.name if self._device else None,
+            "session_latency_ns": self.effective_latency_ns,
+            "has_streaming_data": self.has_streaming_data,
+        }
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -242,6 +268,8 @@ class UnityHandler(QObject):
 
     # ── Connect ───────────────────────────────────────────────────────────────
 
+    @requires(lambda self, device: device is not None and bool(getattr(device, "ip", "")),
+              "device must be non-None and have a non-empty ip")
     def connect_device(self, device: UnityDevice):
         threading.Thread(target=self._do_connect, args=(device,), daemon=True).start()
 
@@ -319,6 +347,8 @@ class UnityHandler(QObject):
             except OSError as e:
                 logger.warning(f"Unity send_command {cmd}: {e}")
 
+    @requires(lambda self, label: isinstance(label, str) and len(label) > 0,
+              "label must be a non-empty string")
     def broadcast_ping(self, label: str) -> int:
         if not self._out or not self._device:
             return -1
@@ -357,15 +387,28 @@ class UnityHandler(QObject):
         """Start or restart polling Unity for data. Safe to call multiple times."""
         if not self._device:
             return
-        # Stop existing loop before starting a new one
-        self._streaming = False
-        import time as _time; _time.sleep(0.05)   # let old loop exit
+        # Stop existing loop deterministically (event-based, not sleep-race) and
+        # wait briefly for it to exit before starting a new one. Previous version
+        # used a 50 ms sleep which was shorter than the loop's 1 s sleep, so two
+        # poll loops could run in parallel.
+        if self._streaming:
+            self._streaming = False
+            self._stop_event.set()
+            # Bounded wait — if it doesn't exit in 1.5x interval, proceed anyway.
+            for _ in range(int((self._stream_interval + 0.2) * 20)):
+                if not self._stop_event.is_set():
+                    break
+                time.sleep(0.05)
+        self._stop_event.clear()
         self._streaming = True
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
     def stop_data_stream(self):
         self._streaming = False
+        self._stop_event.set()
 
+    @requires(lambda self, rate_hz: rate_hz > 0,
+              "rate_hz must be positive")
     def set_stream_rate(self, rate_hz: float):
         """Change streaming rate dynamically. Takes effect on next poll cycle."""
         self._stream_interval = 1.0 / max(rate_hz, 0.1)
@@ -373,10 +416,15 @@ class UnityHandler(QObject):
     def _poll_loop(self):
         while self._running and self._device and self._streaming:
             try:
-                self._out.sendto(b"REQUEST_DATA", (self._device.ip, self._port))
+                if self._out and self._device:
+                    self._out.sendto(b"REQUEST_DATA", (self._device.ip, self._port))
             except OSError:
                 pass
-            time.sleep(self._stream_interval)
+            # Wait on the stop-event so a stop signal exits promptly instead of
+            # waiting out a full _stream_interval.
+            if self._stop_event.wait(timeout=self._stream_interval):
+                break
+        self._stop_event.clear()
 
     def _update_latency(self):
         if not self._rtt_buffer:
@@ -472,16 +520,11 @@ class UnityHandler(QObject):
             self._connect_event.set()
             return
 
-        if self._device and src_ip != self._device.ip:
-            return
-
-        if msg.startswith("DATA,unity,"):
-            self.has_streaming_data = True
-            self._try_emit(self.data_received, msg)
-            return
-
+        # RECONNECT is a connection-RESTORATION message — it must be allowed
+        # through even when self._device is None (because that's exactly the
+        # state it exists to recover from after a Unity domain reload). Handled
+        # here, ABOVE the source-IP gate, alongside HELLO/CONNECTED.
         if msg.startswith("RECONNECT,"):
-            # Unity domain reloaded — restore connection without full re-handshake
             name = msg.split(",", 1)[1] if "," in msg else src_ip
             dev  = UnityDevice(ip=src_ip, name=name)
             self._device = dev
@@ -489,6 +532,22 @@ class UnityHandler(QObject):
             self._try_emit(self.status_changed, "connected")
             self._try_emit(self.log_message, f"[Unity] Reconnected after domain reload: {dev.display_name}")
             self.start_data_stream()   # resume streaming after reconnect
+            return
+
+        # SECURITY/INTEGRITY: After HELLO/CONNECTED/RECONNECT have had their
+        # chance, every remaining message MUST come from the connected device.
+        # Without this gate, any UDP source on the lab subnet sending "PING" or
+        # "ACK:..." or "DATA,unity,..." would be honored — cross-experiment
+        # contamination is possible on a shared subnet.
+        if self._device is None:
+            return  # unconnected — drop everything else
+        if src_ip != self._device.ip:
+            return
+
+        if msg.startswith("DATA,unity,"):
+            self.has_streaming_data = True
+            self._last_sample_ns = time.time_ns()
+            self._try_emit(self.data_received, msg)
             return
 
         if msg == "RECORDING_STARTED":
@@ -504,6 +563,12 @@ class UnityHandler(QObject):
         if msg == "PING":
             self._try_emit(self.log_message, f"[Unity] Ping trigger from {src_ip}")
             self._try_emit(self.ping_requested)
+        elif msg in ("headset_doffed", "headset_donned", "app_quitting"):
+            # Quest lifecycle event — log AND emit a typed signal so the host
+            # can persist it into the syncLog (otherwise the gap reason is
+            # received by the operator and then thrown away).
+            self._try_emit(self.log_message, f"[Unity] {msg}")
+            self._try_emit(self.headset_state_changed, msg)
         elif msg.startswith("ACK:"):
             # Format: ACK:<ping_id> or ACK:<ping_id>:<unity_ns>
             rest    = msg[4:]

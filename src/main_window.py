@@ -25,11 +25,30 @@ import platform as _platform
 from emotibit    import EmotiBitDevice, EmotiBitHandler, EmotiBitStatus
 from sync_logger import SyncLogger
 from unity       import DEFAULT_PORT, UnityDevice, UnityHandler
+from invariants  import SystemInvariants, format_violations
+from self_heal   import RepairTechnician
+from contracts   import requires, ensures, Contract
 
 if _platform.system() == "Darwin":
     from polar_mac import PolarDevice, PolarHandler, PolarStatus
 else:
     from polar     import PolarDevice, PolarHandler, PolarStatus
+
+# ── Tunables (named so comment, code, and log lines can't drift) ───────────────
+FIRST_PING_DELAY_MS  = 10_000   # auto-ping #1 fires this long after Start Recording
+PING_INTERVAL_MS     = 5_000    # spacing between subsequent auto-pings
+AUTO_PING_TOTAL      = 3        # how many auto-pings to fire per session
+WATCHDOG_INTERVAL_MS = 5_000    # how often the per-stream watchdog runs
+
+# Per-sensor silence thresholds — the rate-limit characteristics differ.
+# Polar @ 130 Hz cannot legitimately be silent >2 s. EmotiBit over WiFi
+# blips 2-3 s under access-point load with no real data loss. Unity is polled
+# at ~1 Hz so 6 s is the floor.
+SAMPLE_SILENCE_S = {
+    "emotibit": 5.0,
+    "polar":    2.0,
+    "unity":    6.0,
+}
 
 BG    = "#0f1117"
 PANEL = "#1a1d27"
@@ -940,10 +959,11 @@ class MainWindow(QMainWindow):
         self._session_ts      = None
         self._is_recording    = False
         self._last_unity_device = None   # for auto-reconnect
-        self._output_dir   = Path.home() / "SyncBridge_Recordings"
+        self._output_dir   = Path.home() / "LabStreamLayer_Recordings"
         self._elapsed      = 0
 
         self._sync_logger = SyncLogger(self._output_dir)
+        self._sync_logger.set_log_callback(self._log)   # surface schema-drop warnings
         self._emotibit    = EmotiBitHandler(self)
         self._polar       = PolarHandler(self._output_dir, self)
         self._unity       = UnityHandler(parent=self)
@@ -952,9 +972,9 @@ class MainWindow(QMainWindow):
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._tick)
 
-        # Auto-ping: 3 pings every 5s starting at t=10s after recording
+        # Auto-ping: AUTO_PING_TOTAL pings, first at t=FIRST_PING_DELAY_MS, spacing PING_INTERVAL_MS.
         self._auto_ping_timer = QTimer(self)
-        self._auto_ping_timer.setInterval(2000)   # 2s between pings
+        self._auto_ping_timer.setInterval(PING_INTERVAL_MS)
         self._auto_ping_timer.timeout.connect(self._auto_ping_tick)
         self._auto_ping_count = 0
 
@@ -964,6 +984,28 @@ class MainWindow(QMainWindow):
         self._emotibit.start()
         self._polar.start()
         self._unity.start()
+
+        # Runtime invariants + self-heal layer (G3 + G4). Both are passive until
+        # recording starts; the timer fires inside _watchdog_check.
+        self._invariants = SystemInvariants(
+            emotibit=self._emotibit, polar=self._polar, unity=self._unity,
+            sync_logger=self._sync_logger,
+            is_recording_fn=lambda: self._is_recording,
+            required_fn=lambda d: {
+                "emotibit": self._row_eb.is_required,
+                "polar":    self._row_polar.is_required,
+                "unity":    self._row_unity.is_required,
+            }.get(d, False),
+            sample_silence_s=SAMPLE_SILENCE_S,
+            # Live ref to the parser-seen-set so the invariant can read its
+            # size AND the repair strategy can clear it (same object).
+            parser_seen_set_fn=lambda: getattr(self, "_unity_parse_seen", None),
+        )
+        self._repair = RepairTechnician(
+            emotibit=self._emotibit, polar=self._polar, unity=self._unity,
+            sync_logger=self._sync_logger, log_fn=self._log,
+        )
+
         self._log("Sync Bridge started - waiting for devices...")
         self._load_settings()
 
@@ -1272,7 +1314,7 @@ class MainWindow(QMainWindow):
         self._status_timer.start()
 
         self._watchdog_timer = QTimer(self)
-        self._watchdog_timer.setInterval(5000)
+        self._watchdog_timer.setInterval(WATCHDOG_INTERVAL_MS)
         self._watchdog_timer.timeout.connect(self._watchdog_check)
         self._btn_ping.clicked.connect(self._ping)
 
@@ -1297,6 +1339,14 @@ class MainWindow(QMainWindow):
         self._unity.calibration_changed.connect(self._on_unity_calib)
         self._unity.data_received.connect(self._on_unity_data)
         self._unity.log_message.connect(self._log)
+        self._unity.headset_state_changed.connect(self._on_unity_headset_state)
+        self._emotibit.sensor_event.connect(
+            lambda ev: self._on_handler_sensor_event("emotibit", ev)
+        )
+        if hasattr(self._polar, "sensor_event"):
+            self._polar.sensor_event.connect(
+                lambda ev: self._on_handler_sensor_event("polar", ev)
+            )
 
     # ── EmotiBit picker ────────────────────────────────────────────────────────
 
@@ -1360,6 +1410,8 @@ class MainWindow(QMainWindow):
     # ── Recording ──────────────────────────────────────────────────────────────
 
     @pyqtSlot()
+    @requires(lambda self: not self._is_recording,
+              "_start_rec must not be called while a session is already recording")
     def _start_rec(self):
 
         self._session_ts = SyncLogger.make_session_timestamp()
@@ -1377,44 +1429,20 @@ class MainWindow(QMainWindow):
             self._polar.start_recording(self._session_ts, session_dir)
             self._polar.calibrate_for_recording()
         if self._row_eb.is_required:
-            self._log("[EmotiBit] Checking SD card (up to 5s)...")
-            self._emotibit._rb_event.clear()
             self._emotibit.start_recording()
             self._emotibit.calibrate_for_recording()
-            sd_ok = self._emotibit._rb_event.wait(timeout=5.0)
-            if not sd_ok:
-                self._log("[EmotiBit] ⚠ No RB echo — SD card missing?")
-                self._emotibit.stop_recording()
-                if self._row_polar.is_required:
-                    self._polar.stop_recording()
-                self._sync_logger.close()
-                self._is_recording = False
-                self._timer.stop()
-                self._watchdog_timer.stop()
-                self._auto_ping_timer.stop()
-                self._auto_ping_count = 0
-                self._stack.setCurrentIndex(0)
-                for row in (self._row_eb, self._row_polar, self._row_unity):
-                    row.setVisible(True)
-                self._btn_start.setEnabled(True)
-                self._btn_ping.setEnabled(False)
-                self._update_start_btn()
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.warning(self, "EmotiBit SD Card Missing",
-                    "EmotiBit did not confirm recording started.\n\n"
-                    "Please check the SD card is inserted and try again.")
-                return
+            # Non-blocking SD check — watchdog will warn if no echo within grace period
         if self._row_unity.is_required:
             self._unity.calibrate_for_recording()
-            self._unity.start_data_stream()   # restart if previously stopped
-            self._unity.start_data_stream(rate_hz=3.0)
+            self._unity.start_data_stream(rate_hz=3.0)   # restart if previously stopped
         self._is_recording = True
         self._elapsed = 0
         self._auto_ping_count = 0
         self._timer.start()
         self._watchdog_timer.start()
-        # First auto-ping at t=10s, then every 5s for 3 total
-        QTimer.singleShot(5000, self._start_auto_ping_sequence)  # first ping at t=5s
+        # First auto-ping fires after FIRST_PING_DELAY_MS so it lands AFTER the
+        # 10s record-start calibration burst — never inside it.
+        QTimer.singleShot(FIRST_PING_DELAY_MS, self._start_auto_ping_sequence)
         self._btn_start.setEnabled(False)
         self._btn_ping.setEnabled(True)
         self._btn_ping.setToolTip("")
@@ -1427,9 +1455,26 @@ class MainWindow(QMainWindow):
         self._rec_timer_lbl.setText("00:00:00")
         for row in (self._row_eb, self._row_polar, self._row_unity):
             row.setVisible(False)
-        self._log(f"Session started — auto-ping: 3× starting at t=5s")
+        # Reset silent-failure tracking so a new session starts clean
+        self._unity_parse_seen = set()
+        self._silence_marked = set()   # device names currently in 'silent' state
+        # Fresh budget for self-heal each session — previous attempts don't roll over
+        if hasattr(self, "_repair"):
+            self._repair.reset()
+        self._log(
+            f"Session started — auto-ping: {AUTO_PING_TOTAL}x  "
+            f"first at t={FIRST_PING_DELAY_MS//1000}s, spacing {PING_INTERVAL_MS//1000}s"
+        )
+
+        # Write session_meta.json — see _write_session_meta for fields
+        try:
+            self._write_session_meta(session_dir)
+        except Exception as e:
+            self._log(f"[meta] Failed to write session_meta.json: {e}")
 
     @pyqtSlot()
+    @requires(lambda self: self._is_recording,
+              "_stop_rec must only be called while recording")
     def _stop_rec(self):
         if self._row_polar.is_required:
             self._polar.stop_recording()
@@ -1459,26 +1504,27 @@ class MainWindow(QMainWindow):
             f"Session stopped - {self._sync_logger.ping_count} pings recorded"
         )
 
-    @pyqtSlot()
-    @pyqtSlot()
-    def _on_emotibit_no_sd(self):
-        if not self._is_recording:
-            return
-        self._sensor_warn.setText(
-            "⚠  EmotiBit did not confirm recording — SD card may be missing or unseated"
-        )
-        self._sensor_warn.setVisible(True)
-        self._log("[EmotiBit] ⚠ No RB echo after 5s — SD card missing?")
-
     def _watchdog_check(self):
-        """Every 5s during recording: check each required sensor is actually active."""
+        """
+        Every WATCHDOG_INTERVAL_MS during recording, for each required sensor:
+        1. Check link/connection state.
+        2. Check that data is actually flowing (last_sample_ns within SAMPLE_SILENCE_S).
+        Write `sensor_silent` / `sensor_resumed` markers into the syncLog so
+        post-hoc the gap is recoverable. The previous watchdog only checked
+        the connection enum, so a 'connected but silent' link looked OK.
+        """
         if not self._is_recording:
             return
         warnings = []
+        currently_silent = set()
 
         if self._row_eb.is_required:
-            if self._emotibit.status not in (EmotiBitStatus.CONNECTED, EmotiBitStatus.RECORDING):
+            if getattr(self._emotibit, "given_up", False):
+                warnings.append("\u26a0  EmotiBit DEGRADED \u2014 gave up reconnecting")
+                currently_silent.add("emotibit")
+            elif self._emotibit.status not in (EmotiBitStatus.CONNECTED, EmotiBitStatus.RECORDING):
                 warnings.append("\u26a0  EmotiBit disconnected")
+                currently_silent.add("emotibit")
             elif not self._emotibit.is_writing:
                 elapsed = self._emotibit.seconds_since_recording_start
                 if elapsed > 15.0:
@@ -1494,13 +1540,55 @@ class MainWindow(QMainWindow):
                 warnings.append("⚠  EmotiBit writing stalled — check SD card")
                 self._emotibit.start_recording()
                 self._log("[EmotiBit] ⚠ No EM confirm for 30s — re-sent RB")
+        # NEW: data-flow silence check for EmotiBit (in addition to is_writing).
+        if self._row_eb.is_required:
+            ssls = getattr(self._emotibit, "seconds_since_last_sample", 0.0)
+            if ssls > 0 and ssls > SAMPLE_SILENCE_S["emotibit"]:
+                warnings.append(f"\u26a0  EmotiBit silent {ssls:.1f}s")
+                currently_silent.add("emotibit")
+
         if self._row_polar.is_required:
-            if self._polar.status not in (PolarStatus.RECORDING, PolarStatus.CONNECTED):
+            if getattr(self._polar, "given_up", False):
+                warnings.append("\u26a0  Polar DEGRADED \u2014 gave up reconnecting")
+                currently_silent.add("polar")
+            elif self._polar.status not in (PolarStatus.RECORDING, PolarStatus.CONNECTED):
                 warnings.append("\u26a0  Polar H10 disconnected")
+                currently_silent.add("polar")
+            else:
+                ssls = getattr(self._polar, "seconds_since_last_sample", 0.0)
+                if ssls > 0 and ssls > SAMPLE_SILENCE_S["polar"]:
+                    warnings.append(f"\u26a0  Polar silent {ssls:.1f}s")
+                    currently_silent.add("polar")
 
         if self._row_unity.is_required:
             if not self._unity.is_connected:
                 warnings.append("\u26a0  Unity disconnected")
+                currently_silent.add("unity")
+            else:
+                ssls = getattr(self._unity, "seconds_since_last_sample", 0.0)
+                if ssls > 0 and ssls > SAMPLE_SILENCE_S["unity"]:
+                    warnings.append(f"\u26a0  Unity silent {ssls:.1f}s")
+                    currently_silent.add("unity")
+
+        # Transition-only gap markers \u2014 don't spam syncLog every tick.
+        prev_silent = getattr(self, "_silence_marked", set())
+        for dev in currently_silent - prev_silent:
+            self._write_gap_marker(dev, "sensor_silent")
+        for dev in prev_silent - currently_silent:
+            self._write_gap_marker(dev, "sensor_resumed")
+        self._silence_marked = currently_silent
+
+        # G3+G4: runtime invariant pass + self-heal repair attempts. Surfaces
+        # violations the per-handler watchdog above doesn't see (e.g. logger
+        # writer closed mid-record). Self-heal then runs registered repair
+        # strategies for violations that have one. Both bounded & rate-limited.
+        try:
+            violations = self._invariants.check_all()
+            if violations:
+                self._log(format_violations(violations))
+                self._repair.repair(violations)
+        except Exception as e:
+            self._log(f"[invariants] check_all raised {type(e).__name__}: {e}")
 
         if warnings:
             self._sensor_warn.setText("\n".join(warnings))
@@ -1508,36 +1596,109 @@ class MainWindow(QMainWindow):
         else:
             self._sensor_warn.setVisible(False)
 
+    def _write_session_meta(self, session_dir: Path):
+        """Drop a session_meta.json into the session folder so that, six months
+        from now, you can still tell which app version produced this data, what
+        the sensor IPs were, and which devices were configured 'required'."""
+        import json
+        import subprocess as _sp
+
+        def _git_sha() -> str:
+            try:
+                repo = Path(__file__).resolve().parent.parent
+                return _sp.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, timeout=2
+                ).decode().strip()
+            except Exception:
+                return "unknown"
+
+        # Build per-device blocks via public_summary() — no private-attribute
+        # reach-arounds (those were what the pass-2 audit flagged as the same
+        # hygiene bug repeating itself in this method).
+        def _summary(handler) -> dict:
+            try:
+                return handler.public_summary() if hasattr(handler, "public_summary") else {}
+            except Exception:
+                return {}
+        meta = {
+            "session_ts":     self._session_ts,
+            "started_at_utc": datetime.now(tz=timezone.utc).isoformat(),
+            "app":            "LabStreamLayer",
+            "git_sha":        _git_sha(),
+            "platform":       _platform.platform(),
+            "python":         ".".join(map(str, __import__("sys").version_info[:3])),
+            "devices": {
+                "emotibit": dict(required=self._row_eb.is_required,    **_summary(self._emotibit)),
+                "polar":    dict(required=self._row_polar.is_required, **_summary(self._polar)),
+                "unity":    dict(required=self._row_unity.is_required,
+                                 require_vr_data=self._chk_require_vr_data.isChecked(),
+                                 **_summary(self._unity)),
+            },
+            "tunables": {
+                "first_ping_delay_ms":  FIRST_PING_DELAY_MS,
+                "ping_interval_ms":     PING_INTERVAL_MS,
+                "auto_ping_total":      AUTO_PING_TOTAL,
+                "watchdog_interval_ms": WATCHDOG_INTERVAL_MS,
+                "sample_silence_s":     SAMPLE_SILENCE_S,
+            },
+        }
+        meta_path = session_dir / "session_meta.json"
+        meta_path.write_text(json.dumps(meta, indent=2))
+        self._log(f"[meta] Wrote {meta_path.name}")
+
+    def _write_gap_marker(self, device: str, event: str):
+        """Write a sensor_silent / sensor_resumed row into the syncLog so the
+        post-hoc analysis can locate every gap. Called only on transitions
+        (not every watchdog tick) to keep the syncLog clean. `latency_ns` is
+        empty (not -1) for these events because the value is not applicable —
+        -1 is reserved for ping rows where the device was disconnected.
+        """
+        self._sync_logger.write_event(machine=device, event=event)
+        self._log(f"[watchdog] {device} -> {event}")
+
+    @pyqtSlot(str)
+    def _on_unity_headset_state(self, label: str):
+        """Persist Quest headset don/doff and app_quitting events into the
+        syncLog so the post-hoc analyst can attribute every gap to a cause."""
+        if self._is_recording:
+            self._sync_logger.write_event(machine="unity", event=label)
+            self._log(f"[Unity] {label} → syncLog")
+
+    def _on_handler_sensor_event(self, device: str, event: str):
+        """Persist sensor_lost / sensor_recovered / given_up events that the
+        handlers raise (e.g. EmotiBit auto-reconnect lifecycle) into the
+        syncLog. Operator log alone is not persistent."""
+        if self._is_recording:
+            self._sync_logger.write_event(machine=device, event=event)
+            self._log(f"[{device}] {event} → syncLog")
+
     def _start_auto_ping_sequence(self):
-        """Called at t=10s after recording starts. Fires first ping then starts interval timer."""
+        """First auto-ping fires after FIRST_PING_DELAY_MS, then PING_INTERVAL_MS spacing."""
         if not self._is_recording:
             return
         self._auto_ping_tick()
-        if self._auto_ping_count < 3:
+        if self._auto_ping_count < AUTO_PING_TOTAL:
             self._auto_ping_timer.start()
 
     def _auto_ping_tick(self):
-        """Called every 5s by the interval timer. Sends up to 3 auto-pings."""
-        if not self._is_recording or self._auto_ping_count >= 3:
+        """Fires up to AUTO_PING_TOTAL auto-pings then stops the timer."""
+        if not self._is_recording or self._auto_ping_count >= AUTO_PING_TOTAL:
             self._auto_ping_timer.stop()
             return
         self._auto_ping_count += 1
-        self._log(f"Auto-ping {self._auto_ping_count}/3")
+        self._log(f"Auto-ping {self._auto_ping_count}/{AUTO_PING_TOTAL}")
         self._ping()
-        if self._auto_ping_count >= 3:
+        if self._auto_ping_count >= AUTO_PING_TOTAL:
             self._auto_ping_timer.stop()
             self._log("Auto-ping sequence complete")
 
     @pyqtSlot(str, object)
     def _on_unity_ack(self, ping_id: str, unity_ns):
         """Unity returned its local receive timestamp in the ACK — write Unity row."""
-        lat = (self._unity._session_latency_ns
-               if self._unity._session_latency_ns >= 0
-               else self._unity.calibrated_latency_ns)
         self._sync_logger.log_unity_ack(
             ping_id=ping_id,
             unity_epoch_ns=int(unity_ns),
-            latency_ns=lat,
+            latency_ns=self._unity.effective_latency_ns,
         )
 
     @pyqtSlot()
@@ -1623,6 +1784,7 @@ class MainWindow(QMainWindow):
             # are encoded as: headRot=x , y , z , w
             # Join back from index 3 and split on space-free tokens
             fields = {}
+            _last = None   # MUST init — first token may be a continuation value
             raw = msg.split(",", 3)[-1]   # everything after "DATA,unity,<ts>,"
             for token in raw.split(","):
                 if "=" in token:
@@ -1659,8 +1821,16 @@ class MainWindow(QMainWindow):
                 )
             if "blink" in fields: self._g_u_blink.push(fields["blink"][0])
 
-        except Exception:
-            pass   # never crash the UI on a bad packet
+        except Exception as e:
+            # Never crash the UI on a bad packet — but DO surface a representative
+            # log line per error TYPE per session, not just the very first error
+            # of any kind. New error types (e.g. Unity adds a channel mid-session)
+            # remain visible; repetitions of an already-seen type are suppressed.
+            seen = self.__dict__.setdefault("_unity_parse_seen", set())
+            key = type(e).__name__
+            if key not in seen:
+                seen.add(key)
+                self._log(f"[Unity] DATA parse error ({key}; further {key}s suppressed): {e}")
 
     @pyqtSlot()
     @pyqtSlot()
@@ -1671,23 +1841,40 @@ class MainWindow(QMainWindow):
             self._log(f"[Ping] Error: {traceback.format_exc()}")
 
     def __ping_impl(self):
+        # Refuse to ping when no session is open — keeps us from creating orphan
+        # session folders. Cheaper as a guard than a contract here because _ping
+        # is reachable from auto-ping/timer paths where raising would crash the
+        # timer; soft-decline preserves the user-friendly behaviour.
         if not self._sync_logger._writer:
-            self._session_ts = SyncLogger.make_session_timestamp()
-            p = self._sync_logger.start_session(self._session_ts)
-            self._log(f"Auto-started outlog - {p.name}")
+            self._log("[Ping] Ignored — no active recording. Press Start Recording first.")
+            return
+        Contract.check(self._is_recording,
+                       "_ping called with logger open but _is_recording False — state corrupted",
+                       name="ping_state_consistent")
 
         next_id = f"ping_{self._sync_logger.ping_count + 1:03d}"
 
-        # Send to all devices — returns (send_ns, latency_ns)
-        eb_result  = self._emotibit.send_marker(next_id)
-        pol_result = self._polar.send_marker(next_id)
-        self._unity.broadcast_ping(next_id)
+        # Send to all devices independently — one failure doesn't block others
+        try:
+            eb_result = self._emotibit.send_marker(next_id)
+            eb_ns, eb_lat = eb_result if isinstance(eb_result, tuple) else (0, eb_result)
+        except Exception as e:
+            self._log(f"[EmotiBit] marker error: {e}")
+            eb_ns, eb_lat = 0, -1
 
-        # Unpack safely — guard against any device returning a bare int
-        eb_ns,  eb_lat  = eb_result  if isinstance(eb_result,  tuple) else (0, eb_result)
-        pol_ns, pol_lat = pol_result if isinstance(pol_result, tuple) else (0, pol_result)
+        try:
+            pol_result = self._polar.send_marker(next_id)
+            pol_ns, pol_lat = pol_result if isinstance(pol_result, tuple) else (0, pol_result)
+        except Exception as e:
+            self._log(f"[Polar] marker error: {e}")
+            pol_ns, pol_lat = 0, -1
 
-        # Write LSL + Polar + EmotiBit rows immediately
+        try:
+            self._unity.broadcast_ping(next_id)
+        except Exception as e:
+            self._log(f"[Unity] ping error: {e}")
+
+        # Write LSL + Polar + EmotiBit rows
         pid, ns = self._sync_logger.log_ping(
             polar_send_ns=pol_ns,
             polar_latency_ns=pol_lat,
@@ -1918,6 +2105,7 @@ class MainWindow(QMainWindow):
             self._output_dir = Path(p)
             self._dir_edit.setText(p)
             self._sync_logger = SyncLogger(self._output_dir)
+            self._sync_logger.set_log_callback(self._log)
             self._polar._output_dir = self._output_dir
 
     def _load_settings(self):
@@ -1927,6 +2115,7 @@ class MainWindow(QMainWindow):
         self._output_dir = Path(folder)
         self._dir_edit.setText(folder)
         self._sync_logger = SyncLogger(self._output_dir)
+        self._sync_logger.set_log_callback(self._log)
         self._polar._output_dir = self._output_dir
         # Device checkboxes
         self._row_eb.required_checkbox.setChecked(

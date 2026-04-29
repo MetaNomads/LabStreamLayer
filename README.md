@@ -56,27 +56,30 @@ Double-click **`LabStreamLayer.app`** to run.
 
 ## Output Files
 
-Recordings saved to `~/LabStreamLayer_Recordings/`:
+Recordings saved to `~/LabStreamLayer_Recordings/lsl_<session>/`:
 
 | File | Contents |
 |------|----------|
 | `polar_<session>.csv` | ECG (µV), HR (bpm), RR (ms), markers |
-| `marker_outlog_<session>.csv` | Ping sync log with per-device latency |
-| `unity_ping_log_<session>.csv` | Unity receipt timestamps |
+| `syncLog_<session>.csv` | Ping sync log — one row per (machine × ping) with per-device latency |
+| `session_meta.json` | Session-level metadata: app version, git SHA, device IPs, locked latencies, required-flags |
+| `unity_ping_log_<session>.csv` | Unity receipt timestamps (written by SyncBridge.cs on the Unity host) |
 
-### marker_outlog columns
+### syncLog columns
 
 ```
-ping_id, sls_clock, emotibit_latency_ns, polar_latency_ns, unity_latency_ns
+machine, event, ping_id, local_epoch_ns, latency_ns
 ```
 
 | Column | Description |
 |--------|-------------|
-| `ping_id` | e.g. `ping_001` |
-| `sls_clock` | SLS machine UTC time at send (nanoseconds) |
-| `emotibit_latency_ns` | One-way UDP latency to EmotiBit (RTT/2) |
-| `polar_latency_ns` | One-way BLE latency to Polar H10 (RTT/2) |
-| `unity_latency_ns` | One-way UDP latency to Unity (RTT/2) |
+| `machine` | `lsl` \| `polar` \| `emotibit` \| `unity` |
+| `event` | `ping_sent` \| `ping_received` \| `sensor_lost` \| `sensor_recovered` \| `given_up` \| `sensor_silent` \| `sensor_resumed` \| `headset_doffed` \| `headset_donned` \| `app_quitting` |
+| `ping_id` | e.g. `ping_001` (empty for non-ping events) |
+| `local_epoch_ns` | Clock of the row's machine in nanoseconds since Unix epoch — empty for EmotiBit ping rows (no device echo timestamp available) |
+| `latency_ns` | Calibrated one-way latency (RTT/2). `0` for the `lsl` row of every ping. `-1` if the device was not connected during a real ping. **Empty (`""`)** for non-ping rows (sensor_* / headset_* / app_quitting) where the value is not applicable. Filter accordingly when computing drift. |
+
+Note on calibration semantics: `polar_latency_ns` measures a `read_gatt_char(BATTERY_CHAR)` round-trip, which on the Polar H10 is served from the on-device GATT cache rather than a fresh radio round-trip. The number is stable across the session and useful for relative drift, but should not be interpreted as absolute BLE link RTT. `session_meta.json` records this in `devices.polar.calibration_method`.
 
 **Post-processing alignment:**
 ```

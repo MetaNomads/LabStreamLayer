@@ -18,6 +18,8 @@ from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from contracts import requires, ensures, Contract
+
 try:
     from bleak import BleakClient, BleakScanner
 except ImportError:
@@ -70,6 +72,7 @@ class PolarHandler(QObject):
     rr_sample           = pyqtSignal(float)
     calibration_changed = pyqtSignal(bool)
     battery_changed     = pyqtSignal(int)     # 0-100 percent
+    sensor_event        = pyqtSignal(str)     # "sensor_lost" | "sensor_recovered"
 
     def __init__(self, output_dir: Path, parent=None):
         super().__init__(parent)
@@ -87,6 +90,40 @@ class PolarHandler(QObject):
         self._rtt_buffer        = deque(maxlen=20)  # rolling RTT samples
         self._session_latency_ns: int = -1           # locked at record-start calibration
         self._calib_result: int = -1
+        self._last_sample_ns: int = 0                # for silent-stream watchdog
+        self._given_up: bool = False
+        # Handle for the asyncio call_later that schedules a reconnect after
+        # bleak's disconnected_callback fires. Held so the user-initiated
+        # `disconnect` action can cancel it (otherwise a 5s race window lets a
+        # canceled reconnect resurrect the strap the user just dropped).
+        self._pending_reconnect = None
+
+    @property
+    def seconds_since_last_sample(self) -> float:
+        if self._last_sample_ns == 0: return 0.0
+        return (time.time_ns() - self._last_sample_ns) / 1e9
+
+    @property
+    def effective_latency_ns(self) -> int:
+        return self._session_latency_ns if self._session_latency_ns >= 0 else self.calibrated_latency_ns
+
+    @property
+    def given_up(self) -> bool:
+        return self._given_up
+
+    @ensures(lambda result, *_args, **_kw: isinstance(result, dict),
+             "public_summary must return a dict")
+    def public_summary(self) -> dict:
+        """Honest snapshot for session_meta.json — replaces the
+        `self._polar._connected.display_name` reach-around."""
+        dev = getattr(self, "_connected", None)
+        return {
+            "device":  getattr(dev, "display_name", None) if dev else None,
+            "address": getattr(dev, "address", None) if dev else None,
+            "session_latency_ns":   self.effective_latency_ns,
+            "calibration_method":   "battery_char_read",  # see PASS2 audit finding
+            "given_up":             self._given_up,
+        }
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -109,6 +146,9 @@ class PolarHandler(QObject):
     def disconnect(self):
         self._send_cmd(("disconnect",))
 
+    @requires(lambda self, session_ts, session_dir=None:
+              isinstance(session_ts, str) and len(session_ts) > 0,
+              "session_ts must be a non-empty string")
     def start_recording(self, session_ts: str, session_dir: "Path | None" = None):
         folder = session_dir if session_dir else self._output_dir
         folder.mkdir(parents=True, exist_ok=True)
@@ -132,6 +172,10 @@ class PolarHandler(QObject):
         self._send_cmd(("stop_rec",))
         self._end_recording()
 
+    @requires(lambda self, label: isinstance(label, str) and len(label) > 0,
+              "marker label must be a non-empty string")
+    @ensures(lambda result, *_args, **_kw: isinstance(result, tuple) and len(result) == 2,
+             "send_marker must return a 2-tuple")
     def send_marker(self, label: str) -> tuple:
         """Send marker. Returns (send_ns, calibrated_one_way_latency_ns)."""
         send_ns = time.time_ns()
@@ -240,6 +284,7 @@ class PolarHandler(QObject):
                 if self._writer and recording:
                     self._writer.writerow([time.time_ns(), r, "", "", ""])
                 self.has_streaming_data = True
+                self._last_sample_ns = time.time_ns()
                 self._try_emit(self.ecg_sample, float(r))
                 i += 3
 
@@ -251,6 +296,7 @@ class PolarHandler(QObject):
             if bpm > 0:
                 if self._writer and recording:
                     self._writer.writerow([time.time_ns(), "", bpm, "", ""])
+                self._last_sample_ns = time.time_ns()
                 self._try_emit(self.hr_sample, bpm)
             if flags & 0x10:
                 off = 3 if (flags & 0x01) else 2
@@ -261,14 +307,8 @@ class PolarHandler(QObject):
                     self._try_emit(self.rr_sample, rr)
                     off += 2
 
-        def on_disconnect(c: BleakClient):
-            self._try_emit(self.log_message, "[Polar] Device disconnected — will retry in 5s")
-            self._set_status(PolarStatus.IDLE)
-            # Schedule reconnect via the asyncio loop (not ensure_future from sync context)
-            if self._loop and self._loop.is_running():
-                self._loop.call_later(5.0, lambda: self._loop.create_task(
-                    self._cmd_queue.put(("connect", device))
-                ) if device else None)
+        # on_disconnect is built freshly inside the connect handler so it captures
+        # the current device via default-arg, not enclosing-scope closure.
 
         async def keepalive(client):
             """Read battery every 10s to prevent CoreBluetooth idle timeout."""
@@ -284,6 +324,11 @@ class PolarHandler(QObject):
             action = cmd[0]
 
             if action == "quit":
+                # Cancel any pending reconnect first so it can't fire after quit.
+                if self._pending_reconnect is not None:
+                    try: self._pending_reconnect.cancel()
+                    except Exception: pass
+                    self._pending_reconnect = None
                 if client and client.is_connected:
                     try:
                         await client.write_gatt_char(PMD_CONTROL, ECG_STOP, response=False)
@@ -351,6 +396,24 @@ class PolarHandler(QObject):
                     continue
 
                 self._try_emit(self.log_message, f"[Polar] Connecting to {ble_dev.name}...")
+                # Build on_disconnect freshly so it captures THIS device explicitly
+                # (default-arg capture, not enclosing-scope closure).
+                _captured_device = device
+                def on_disconnect(c, dev=_captured_device):
+                    self._try_emit(self.log_message,
+                        f"[Polar] sensor_lost — {dev.name} ({getattr(dev,'address','?')}); "
+                        f"reconnecting in 5s"
+                    )
+                    self._try_emit(self.sensor_event, "sensor_lost")
+                    self._set_status(PolarStatus.IDLE)
+                    if self._loop and self._loop.is_running():
+                        # Save the call_later handle so a user-initiated
+                        # `disconnect` action can cancel the pending reconnect
+                        # before it fires (otherwise the 5s window lets the
+                        # old strap come back to life after a deliberate swap).
+                        def _do_reconnect(d=dev):
+                            self._loop.create_task(self._cmd_queue.put(("connect", d)))
+                        self._pending_reconnect = self._loop.call_later(5.0, _do_reconnect)
                 try:
                     client = BleakClient(ble_dev, disconnected_callback=on_disconnect, timeout=20.0)
                     await client.connect()
@@ -368,6 +431,11 @@ class PolarHandler(QObject):
                     await asyncio.sleep(0.3)
                     await client.write_gatt_char(PMD_CONTROL, ECG_START, response=True)
                     self._try_emit(self.log_message, "[Polar] ECG stream started (131 Hz)")
+                    # If we previously emitted sensor_lost (via on_disconnect),
+                    # emit sensor_recovered now so syncLog records the gap close.
+                    self._try_emit(self.sensor_event, "sensor_recovered")
+                    # Pending reconnect (if any) just consumed itself.
+                    self._pending_reconnect = None
 
                     self._set_status(PolarStatus.CONNECTED)
                     # Read battery level
@@ -388,6 +456,27 @@ class PolarHandler(QObject):
                     client = None
 
             elif action == "disconnect":
+                # User-initiated disconnect — cancel any auto-reconnect that
+                # bleak's disconnected_callback may have just scheduled.
+                if self._pending_reconnect is not None:
+                    try: self._pending_reconnect.cancel()
+                    except Exception: pass
+                    self._pending_reconnect = None
+                # Also drain any already-queued ("connect", _) entries that
+                # raced ahead of us.
+                try:
+                    while not self._cmd_queue.empty():
+                        peek = self._cmd_queue.get_nowait()
+                        if peek and peek[0] == "connect":
+                            self._try_emit(self.log_message,
+                                "[Polar] Dropped queued reconnect (user-initiated disconnect)"
+                            )
+                        else:
+                            # Not a connect — put it back at the front.
+                            await self._cmd_queue.put(peek)
+                            break
+                except Exception:
+                    pass
                 if client and client.is_connected:
                     try:
                         await client.write_gatt_char(PMD_CONTROL, ECG_STOP, response=False)
@@ -414,22 +503,25 @@ class PolarHandler(QObject):
                 self._try_emit(self.log_message, f"[Polar] marker sent: {label}")
 
             elif action == "calibrate_for_recording":
-                # 10 BLE probes at 1s intervals, update rolling buffer
+                # 10 BLE probes at 1s intervals against BATTERY_CHAR (read-only,
+                # cached on device) — does NOT compete with the active ECG stream
+                # for the PMD_CONTROL endpoint. Previous version wrote ECG_SETTINGS
+                # to PMD_CONTROL during streaming, which can drop ECG samples.
                 if not client or not client.is_connected:
                     self._try_emit(self.log_message, "[Polar] Record-start calibration skipped — not connected")
                     continue
-                self._try_emit(self.log_message, "[Polar] Record-start calibration (10 probes × 1s)...")
+                self._try_emit(self.log_message, "[Polar] Record-start calibration (10 probes × 1s, BATTERY_CHAR)...")
                 for _ in range(10):
                     try:
                         t1 = time.time_ns()
-                        await client.write_gatt_char(PMD_CONTROL, ECG_SETTINGS, response=True)
+                        await client.read_gatt_char(BATTERY_CHAR)
                         self._rtt_buffer.append(time.time_ns() - t1)
                     except Exception:
                         pass
                     await asyncio.sleep(1.0)
                 self._update_latency()
                 self._session_latency_ns = self.calibrated_latency_ns
-                self._try_emit(self.log_message, 
+                self._try_emit(self.log_message,
                     f"[Polar] Session latency locked: one-way={self._session_latency_ns/1e6:.1f}ms "
                     f"(n={len(self._rtt_buffer)} samples)"
                 )
